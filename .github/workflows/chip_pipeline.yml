@@ -47,7 +47,12 @@ jobs:
             echo "今日無新資料(分點可能還沒齊,等補跑)"
           else
             git commit -m "data: $(date -u +%F)"
-            git push
+            # push 前先接遠端,避開「bot 與手動 push / 兩次排程」同時推 main 的競賽
+            for i in 1 2 3; do
+              git pull --rebase --autostash origin main || true
+              if git push; then echo "push 成功"; break; fi
+              echo "push 撞車,重試 $i ..."; sleep 3
+            done
           fi
 
 # 客戶端下載(raw URL):
