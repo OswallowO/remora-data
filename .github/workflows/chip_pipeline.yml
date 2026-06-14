@@ -35,8 +35,10 @@ jobs:
       - name: Run pipeline（抓分點 → 算 achip → 產 stocklist）
         env:
           FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
+          # 手動觸發填的日期(排程/留空時為空字串 → 腳本自動用今天)
+          INPUT_DATE: ${{ github.event.inputs.date }}
         run: |
-          python cloud_chip_pipeline.py --out data --syms-file group_syms.txt --top-n 10
+          python cloud_chip_pipeline.py --out data --syms-file group_syms.txt --top-n 10 --date "$INPUT_DATE"
 
       - name: Commit data（有變更才 commit）
         run: |
