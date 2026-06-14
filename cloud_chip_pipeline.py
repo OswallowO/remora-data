@@ -1,0 +1,236 @@
+# -*- coding: utf-8 -*-
+"""v2.1.0 L2 (2026-06-12) 雲端籌碼資料管線原型 — 每日盤後跑一次
+
+目的:讓發佈版客戶端不依賴 FinMind token / 85克報告,
+     由雲端每日產出三類日檔 JSON,客戶端下載即用。
+
+資料源(探測結果 2026-06-12):
+  ① TWSE OpenAPI 融資融券(MI_MARGN)+ 處置股(punish)— 官方、免費、無 CAPTCHA ✓
+  ② TPEx OpenAPI(上櫃對應資料)
+  ③ 分點隔日沖(FinMind TaiwanStockTradingDailyReport)— 集中用「一個」雲端 token,
+     客戶端不需自備;CAPTCHA 牆使 bsr.twse.com.tw 直爬不可靠(已探測:CaptchaControl)
+  ④ 跑 achip 排名(2×z(nbr) + z(churn) + z(套牢))→ 產出「明日自動 stocklist」
+
+部署選項(擇一):
+  A. GitHub Actions cron(免費、零維運;artifacts 或 commit 到 data repo)
+  B. Cloudflare Workers Cron + R2(免費額度內;Workers 呼叫此腳本的 HTTP 版)
+  C. 任何一台常開機器的工作排程器(最簡單,本機即可先跑)
+
+輸出:out_dir/YYYY-MM-DD/
+  margin.json     融資融券(上市+上櫃)
+  punish.json     處置股
+  branch.json     分點特徵(nbr/churn_r/dt_buy_avg/top5_net_r)— 需 FINMIND_TOKEN
+  stocklist.json  明日自動 stocklist(achip top-N)— 需 branch.json
+
+用法:
+  py -3.10 services/cloud_chip_pipeline.py --out cloud_data [--token-env FINMIND_TOKEN] [--top-n 20]
+"""
+import argparse, datetime, io, json, os, sys, time, urllib.parse, urllib.request
+
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+UA = {'User-Agent': 'Mozilla/5.0', 'accept': 'application/json'}
+
+
+def _get_json(url, timeout=20):
+    req = urllib.request.Request(url, headers=UA)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.load(r)
+
+
+def fetch_twse_margin():
+    """① 上市融資融券(官方 OpenAPI,當日盤後更新)"""
+    return _get_json('https://openapi.twse.com.tw/v1/exchangeReport/MI_MARGN')
+
+
+def fetch_twse_punish():
+    """① 處置股(官方 OpenAPI)"""
+    return _get_json('https://openapi.twse.com.tw/v1/announcement/punish')
+
+
+def fetch_tpex_margin():
+    """② 上櫃融資融券(TPEx OpenAPI;endpoint 由 swagger.json 確認)"""
+    try:
+        return _get_json('https://www.tpex.org.tw/openapi/v1/tpex_mainboard_margin_balance')
+    except Exception as e:
+        print(f'[TPEx margin] 失敗(非致命): {e}')
+        return []
+
+
+def fetch_twse_quotes():
+    """①b 上市全部個股當日行情(STOCK_DAY_ALL:Code/ClosingPrice/Change …)→ lup 反推用"""
+    return _get_json('https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL')
+
+
+def fetch_tpex_quotes():
+    """②b 上櫃全部個股當日行情(SecuritiesCompanyCode/Close/Change …)"""
+    try:
+        return _get_json('https://www.tpex.org.tw/openapi/v1/tpex_mainboard_quotes')
+    except Exception as e:
+        print(f'[TPEx quotes] 失敗(非致命): {e}')
+        return []
+
+
+def _tick(p):
+    if p < 10: return 0.01
+    if p < 50: return 0.05
+    if p < 100: return 0.1
+    if p < 500: return 0.5
+    if p < 1000: return 1.0
+    return 5.0
+
+
+def _floor_tick(p):
+    t = _tick(p)
+    return round(int(p / t + 1e-9) * t, 2)
+
+
+def _num(x):
+    try:
+        return float(str(x).replace(',', '').replace('+', ''))
+    except Exception:
+        return 0.0
+
+
+def compute_lup_map(twse_rows, tpex_rows):
+    """當日漲停價 map {sym: lup}:前收 = Close − Change,lup = floor_tick(前收 × 1.10)。
+    (achip 的套牢度分母 = 特徵同日的漲停價,與 分點籌碼_全市場特徵v2 的回測用法一致)"""
+    lup = {}
+    for r in (twse_rows or []):
+        c = _num(r.get('ClosingPrice')); ch = _num(r.get('Change'))
+        # TWSE Change 可能帶正負字串;'X' 等非數字 → 0
+        prev = c - ch
+        if prev > 0:
+            lup[str(r.get('Code', '')).strip()] = _floor_tick(prev * 1.10)
+    for r in (tpex_rows or []):
+        c = _num(r.get('Close')); ch = _num(r.get('Change'))
+        prev = c - ch
+        if prev > 0:
+            lup.setdefault(str(r.get('SecuritiesCompanyCode', '')).strip(), _floor_tick(prev * 1.10))
+    return {k: v for k, v in lup.items() if k and v > 0}
+
+
+def fetch_finmind_branch(token, syms, date_str):
+    """③ 分點買賣日報(FinMind);回 {sym: rows}。
+    產品化注意:全市場逐檔抓量大,僅抓族群清單股(~450 檔);
+    free tier 配額不足時需付費版或分批,token 集中放雲端。"""
+    out = {}
+    base = 'https://api.finmindtrade.com/api/v4/data'
+    for i, sym in enumerate(syms):
+        q = urllib.parse.urlencode({
+            'dataset': 'TaiwanStockTradingDailyReport',
+            'data_id': sym, 'start_date': date_str, 'end_date': date_str,
+            'token': token})
+        try:
+            d = _get_json(f'{base}?{q}', timeout=30)
+            rows = d.get('data', [])
+            if rows: out[sym] = rows
+        except Exception as e:
+            print(f'  [FinMind] {sym}: {e}')
+        if i % 20 == 19:
+            time.sleep(1.0)   # 禮貌限速
+    return out
+
+
+def compute_branch_features(branch_rows):
+    """把分點原始列轉成 achip 特徵 — 公式逐行對齊原研究
+    verify_scripts/finmind_universe_fetch_v2.py feats()(= 分點籌碼_全市場特徵v2.json 產生器):
+    churn_r    = Σ min(買,賣) / 總買張(分點當沖比)
+    top5_net_r = 淨買前 5 名合計 / 總買張
+    dt_buy_avg = 淨買前 5 分點「買量加權均價」(套牢度分子)
+    nbr        = 分點列數(該股當日有交易的分點家數)"""
+    feats = {}
+    for sym, rows in branch_rows.items():
+        try:
+            if not rows or len(rows) < 3:
+                continue
+            B = [(float(r.get('buy', 0) or 0), float(r.get('sell', 0) or 0),
+                  float(r.get('price', 0) or 0)) for r in rows]
+            nets = sorted((b - s) for b, s, p in B)
+            churns = [min(b, s) for b, s, p in B]
+            tb = sum(b for b, s, p in B) or 1
+            Bn = sorted(B, key=lambda t: -(t[0] - t[1]))[:5]
+            wb = sum(b for b, s, p in Bn) or 1
+            dt_buy_avg = sum(b * p for b, s, p in Bn) / wb
+            feats[sym] = {
+                'churn_r': round(sum(churns) / tb, 5),
+                'top5_net_r': round(sum(nets[-5:]) / tb, 5),
+                'dt_buy_avg': round(dt_buy_avg, 3),
+                'nbr': len(rows),
+            }
+        except Exception:
+            continue
+    return feats
+
+
+def achip_stocklist(feats, lup_map, top_n=20):
+    """④ achip 排名:2×z(nbr) + z(churn_r) + z(dt_buy_avg/漲停價) → top-N
+    (公式對齊 交易程式 _build_chip_diff_branch achip 模式)"""
+    base = {s: m for s, m in feats.items() if lup_map.get(s, 0) > 0}
+    if not base: return []
+    def z(d):
+        vs = list(d.values())
+        mu = sum(vs) / len(vs)
+        sd = (sum((x - mu) ** 2 for x in vs) / len(vs)) ** 0.5 or 1.0
+        return {k: (x - mu) / sd for k, x in d.items()}
+    zs = z({s: m['dt_buy_avg'] / lup_map[s] for s, m in base.items()})
+    zn = z({s: m.get('nbr', 0.0) for s, m in base.items()})
+    zh = z({s: m.get('churn_r', 0.0) for s, m in base.items()})
+    ranked = sorted(((s, 2.0 * zn[s] + zh[s] + zs[s]) for s in base), key=lambda t: -t[1])
+    return [s for s, _ in ranked[:top_n]]
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--out', default='cloud_data')
+    ap.add_argument('--token-env', default='FINMIND_TOKEN')
+    ap.add_argument('--top-n', type=int, default=10,
+                    help='achip top-N(生產參數 10:4 季套風控 +729%%、2026Q2 OOS +134%%)')
+    ap.add_argument('--syms-file', default='', help='族群清單股票檔(每行一檔);省略則跳過分點層')
+    ap.add_argument('--date', default='', help='覆寫日期 YYYY-MM-DD(回補用;預設今天)')
+    args = ap.parse_args()
+
+    today = args.date or datetime.date.today().strftime('%Y-%m-%d')
+    out_dir = os.path.join(args.out, today)
+    os.makedirs(out_dir, exist_ok=True)
+    print(f'[cloud_chip_pipeline] {today} → {out_dir}')
+
+    # 第一層:官方 OpenAPI(零依賴,一定要成功)
+    margin = {'twse': fetch_twse_margin(), 'tpex': fetch_tpex_margin()}
+    json.dump(margin, open(os.path.join(out_dir, 'margin.json'), 'w', encoding='utf-8'), ensure_ascii=False)
+    print(f'  margin.json: 上市 {len(margin["twse"])} + 上櫃 {len(margin["tpex"])} 筆')
+    punish = fetch_twse_punish()
+    json.dump(punish, open(os.path.join(out_dir, 'punish.json'), 'w', encoding='utf-8'), ensure_ascii=False)
+    print(f'  punish.json: {len(punish)} 筆')
+
+    # 第一層b:全市場行情 → 當日漲停價 map(achip 套牢度分母;免 token)
+    quotes_twse, quotes_tpex = fetch_twse_quotes(), fetch_tpex_quotes()
+    lup_map = compute_lup_map(quotes_twse, quotes_tpex)
+    json.dump(lup_map, open(os.path.join(out_dir, 'lup.json'), 'w', encoding='utf-8'), ensure_ascii=False)
+    print(f'  lup.json: {len(lup_map)} 檔漲停價(上市 {len(quotes_twse)} + 上櫃 {len(quotes_tpex)} 行情)')
+
+    # 第二層:分點(token 集中放雲端,客戶端不需要)
+    token = os.environ.get(args.token_env, '')
+    if token and args.syms_file and os.path.exists(args.syms_file):
+        syms = [l.strip() for l in open(args.syms_file, encoding='utf-8') if l.strip()]
+        print(f'  分點層:抓 {len(syms)} 檔...')
+        rows = fetch_finmind_branch(token, syms, today)
+        feats = compute_branch_features(rows)
+        json.dump(feats, open(os.path.join(out_dir, 'branch.json'), 'w', encoding='utf-8'), ensure_ascii=False)
+        print(f'  branch.json: {len(feats)} 檔特徵')
+
+        # 第三層:自動 stocklist(achip top-N;字母序 = 客戶端引擎 day_stocks 順序)
+        # 此清單供「下一個交易日」使用;客戶端 _resolve_daily_stocklist 會往回
+        # 找最近一份(≤12 天)並驗新鮮度
+        sl = sorted(achip_stocklist(feats, lup_map, args.top_n))
+        json.dump({'date': today, 'codes': sl, 'top_n': args.top_n,
+                   'source': 'cloud_chip_pipeline', 'formula': 'achip=2z(nbr)+z(churn)+z(sutao)',
+                   'generated_at': datetime.datetime.now().isoformat(timespec='seconds')},
+                  open(os.path.join(out_dir, 'stocklist.json'), 'w', encoding='utf-8'),
+                  ensure_ascii=False, indent=1)
+        print(f'  stocklist.json: top-{args.top_n} → {sl}')
+    else:
+        print('  分點層跳過(無 token 或無 syms-file)— 官方層已完成,客戶端融資券/處置/漲停價可用')
+
+
+if __name__ == '__main__':
+    main()

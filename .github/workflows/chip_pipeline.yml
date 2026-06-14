@@ -1,0 +1,50 @@
+# REMORA 雲端籌碼管線 — 每日盤後自動產出 stocklist(跑在 GitHub 雲端,你電腦關機也照跑)
+# 部署:把整個 cloud_pipeline_deploy/ 內容放到一個(建議私有)data repo 根目錄,
+#       repo Settings → Secrets → Actions 新增 FINMIND_TOKEN。完成後每交易日自動跑。
+name: daily-chip-pipeline
+
+on:
+  schedule:
+    # 台股 13:30 收盤。FinMind 分點日報傍晚才齊 → 跑兩次確保抓到(都在隔日 09:00 開盤前)。
+    - cron: '0 11 * * 1-5'    # UTC 11:00 = 台北 19:00(主跑)
+    - cron: '30 23 * * 0-4'   # UTC 23:30 = 台北 07:30 隔日(補跑;分點若傍晚還沒齊,早上補上)
+  workflow_dispatch: {}        # 也可手動觸發(Actions 頁面按 Run workflow)
+
+# 讓 workflow 能 push 回 repo
+permissions:
+  contents: write
+
+# 同一天兩次排程不互相打架
+concurrency:
+  group: chip-pipeline
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+
+      - name: Run pipeline（抓分點 → 算 achip → 產 stocklist）
+        env:
+          FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
+        run: |
+          python cloud_chip_pipeline.py --out data --syms-file group_syms.txt --top-n 10
+
+      - name: Commit data（有變更才 commit）
+        run: |
+          git config user.name "chip-pipeline-bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add data/
+          if git diff --cached --quiet; then
+            echo "今日無新資料(分點可能還沒齊,等補跑)"
+          else
+            git commit -m "data: $(date -u +%F)"
+            git push
+          fi
+
+# 客戶端下載(raw URL):
+#   https://raw.githubusercontent.com/<你的帳號>/<data-repo>/main/data/<YYYY-MM-DD>/stocklist.json
+# 私有 repo 的 raw URL 需 token;若想公開下載可把 data repo 設公開(只含籌碼清單,無機密)。
