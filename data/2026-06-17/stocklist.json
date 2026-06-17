@@ -1,8 +1,19 @@
 {
  "date": "2026-06-17",
- "codes": [],
+ "codes": [
+  "1802",
+  "2337",
+  "2344",
+  "2399",
+  "2408",
+  "2409",
+  "3189",
+  "3481",
+  "4976",
+  "6770"
+ ],
  "top_n": 10,
  "source": "cloud_chip_pipeline",
  "formula": "achip=2z(nbr)+z(churn)+z(sutao)",
- "generated_at": "2026-06-17T02:03:23"
+ "generated_at": "2026-06-17T16:52:39"
 }
