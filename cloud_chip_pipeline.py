@@ -179,6 +179,28 @@ def achip_stocklist(feats, lup_map, top_n=20):
     return [s for s, _ in ranked[:top_n]]
 
 
+def latest_branch_date(token, probe='2330', lookback=12):
+    """從今天單日往回探,回最新「有分點」的交易日。
+    TaiwanStockTradingDailyReport 只支援單日查(範圍會 400)→ 逐日探。
+    根治用:不靠執行時鐘 → 免疫 GitHub 排程延遲/跨午夜抓錯天/盤前空抓。"""
+    today = datetime.date.today()
+    for back in range(lookback):
+        d = today - datetime.timedelta(days=back)
+        if d.weekday() >= 5:  # 週六日跳過
+            continue
+        ds = d.isoformat()
+        q = urllib.parse.urlencode({'dataset': 'TaiwanStockTradingDailyReport', 'data_id': probe,
+                                    'start_date': ds, 'end_date': ds, 'token': token})
+        try:
+            r = _get_json(f'https://api.finmindtrade.com/api/v4/data?{q}', timeout=40)
+            if r.get('data'):
+                return ds
+        except Exception:
+            pass
+        time.sleep(0.3)
+    return None
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--out', default='cloud_data')
@@ -188,8 +210,18 @@ def main():
     ap.add_argument('--syms-file', default='', help='族群清單股票檔(每行一檔);省略則跳過分點層')
     ap.add_argument('--date', default='', help='覆寫日期 YYYY-MM-DD(回補用;預設今天)')
     args = ap.parse_args()
+    token = os.environ.get(args.token_env, '')
 
-    today = args.date or datetime.date.today().strftime('%Y-%m-%d')
+    # 根治日期:不用「執行當下 UTC 日期」(GitHub 排程延遲會跨午夜抓錯天),
+    # 改問 FinMind「現在最新有分點的是哪天」就抓那天 → 免疫排程時間。
+    if args.date:
+        today = args.date
+    elif token and args.syms_file and os.path.exists(args.syms_file):
+        _ld = latest_branch_date(token)
+        today = _ld or datetime.date.today().strftime('%Y-%m-%d')
+        print(f'[date] FinMind 最新分點日 = {today}' + ('' if _ld else '(偵測失敗→退回系統日期)'))
+    else:
+        today = datetime.date.today().strftime('%Y-%m-%d')
     out_dir = os.path.join(args.out, today)
     os.makedirs(out_dir, exist_ok=True)
     print(f'[cloud_chip_pipeline] {today} → {out_dir}')
@@ -219,8 +251,7 @@ def main():
     json.dump(lup_map, open(os.path.join(out_dir, 'lup.json'), 'w', encoding='utf-8'), ensure_ascii=False)
     print(f'  lup.json: {len(lup_map)} 檔漲停價(上市 {len(quotes_twse)} + 上櫃 {len(quotes_tpex)} 行情)')
 
-    # 第二層:分點(token 集中放雲端,客戶端不需要)
-    token = os.environ.get(args.token_env, '')
+    # 第二層:分點(token 已於頂部讀取)
     if token and args.syms_file and os.path.exists(args.syms_file):
         syms = [l.strip() for l in open(args.syms_file, encoding='utf-8') if l.strip()]
         print(f'  分點層:抓 {len(syms)} 檔...')
