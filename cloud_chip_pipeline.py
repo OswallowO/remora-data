@@ -175,7 +175,7 @@ def achip_stocklist(feats, lup_map, top_n=20):
     zs = z({s: m['dt_buy_avg'] / lup_map[s] for s, m in base.items()})
     zn = z({s: m.get('nbr', 0.0) for s, m in base.items()})
     zh = z({s: m.get('churn_r', 0.0) for s, m in base.items()})
-    ranked = sorted(((s, 2.0 * zn[s] + zh[s] + zs[s]) for s in base), key=lambda t: -t[1])
+    ranked = sorted(((s, zn[s] + 2.0 * zs[s]) for s in base), key=lambda t: -t[1])
     return [s for s, _ in ranked[:top_n]]
 
 
@@ -193,6 +193,17 @@ def main():
     out_dir = os.path.join(args.out, today)
     os.makedirs(out_dir, exist_ok=True)
     print(f'[cloud_chip_pipeline] {today} → {out_dir}')
+
+    # 重試友善:排程(無 --date)時,若今日 stocklist 已就緒(codes 非空)→ 直接跳過,
+    # 不重抓、不蓋掉好資料。供「每 10 分排程重試直到分點公佈」用。
+    _sl_path = os.path.join(out_dir, 'stocklist.json')
+    if (not args.date) and os.path.exists(_sl_path):
+        try:
+            _ex = json.load(open(_sl_path, encoding='utf-8'))
+            if _ex.get('codes'):
+                print(f"  OK {today} stocklist 已就緒({len(_ex['codes'])} 檔)→ 本次跳過"); return
+        except Exception:
+            pass
 
     # 第一層:官方 OpenAPI(零依賴,一定要成功)
     margin = {'twse': fetch_twse_margin(), 'tpex': fetch_tpex_margin()}
@@ -215,8 +226,11 @@ def main():
         print(f'  分點層:抓 {len(syms)} 檔...')
         rows = fetch_finmind_branch(token, syms, today)
         feats = compute_branch_features(rows)
+        if not feats:
+            print(f'  WAIT 分點尚未公佈或無資料({today})→ 本次不產出 branch/stocklist,等下次排程重試')
+            return
         json.dump(feats, open(os.path.join(out_dir, 'branch.json'), 'w', encoding='utf-8'), ensure_ascii=False)
-        print(f'  branch.json: {len(feats)} 檔特徵')
+        print(f'  OK branch.json: {len(feats)} 檔特徵 — 分點就緒 @ {datetime.datetime.utcnow():%Y-%m-%d %H:%M} UTC')
 
         # 第三層:自動 stocklist(achip top-N;字母序 = 客戶端引擎 day_stocks 順序)
         # 此清單供「下一個交易日」使用;客戶端 _resolve_daily_stocklist 會往回
