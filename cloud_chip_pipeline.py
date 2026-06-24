@@ -201,6 +201,22 @@ def latest_branch_date(token, probe='2330', lookback=12):
     return None
 
 
+def _append_attempt_log(out_root, status, finmind_latest, target):
+    """每次排程嘗試都記一行(UTC+台北 + FinMind 最新分點日 + 結果)→ commit 回 repo,
+    供事後分析『FinMind 實際何時公佈當日分點』。對應 22:30~00:00 每 10 分重試排程。"""
+    try:
+        now = datetime.datetime.utcnow()
+        rec = {'utc': now.strftime('%Y-%m-%d %H:%M:%S'),
+               'taipei': (now + datetime.timedelta(hours=8)).strftime('%Y-%m-%d %H:%M:%S'),
+               'finmind_latest': finmind_latest, 'target': target, 'status': status}
+        os.makedirs(out_root, exist_ok=True)
+        with open(os.path.join(out_root, '_fetch_attempts.jsonl'), 'a', encoding='utf-8') as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + '\n')
+        print(f"[attempt] 台北 {rec['taipei']} | FinMind最新={finmind_latest} | {status}")
+    except Exception:
+        pass
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--out', default='cloud_data')
@@ -214,12 +230,13 @@ def main():
 
     # 根治日期:不用「執行當下 UTC 日期」(GitHub 排程延遲會跨午夜抓錯天),
     # 改問 FinMind「現在最新有分點的是哪天」就抓那天 → 免疫排程時間。
+    _finmind_latest = None
     if args.date:
         today = args.date
     elif token and args.syms_file and os.path.exists(args.syms_file):
-        _ld = latest_branch_date(token)
-        today = _ld or datetime.date.today().strftime('%Y-%m-%d')
-        print(f'[date] FinMind 最新分點日 = {today}' + ('' if _ld else '(偵測失敗→退回系統日期)'))
+        _finmind_latest = latest_branch_date(token)
+        today = _finmind_latest or datetime.date.today().strftime('%Y-%m-%d')
+        print(f'[date] FinMind 最新分點日 = {today}' + ('' if _finmind_latest else '(偵測失敗→退回系統日期)'))
     else:
         today = datetime.date.today().strftime('%Y-%m-%d')
     out_dir = os.path.join(args.out, today)
@@ -233,7 +250,9 @@ def main():
         try:
             _ex = json.load(open(_sl_path, encoding='utf-8'))
             if _ex.get('codes'):
-                print(f"  OK {today} stocklist 已就緒({len(_ex['codes'])} 檔)→ 本次跳過"); return
+                print(f"  OK {today} stocklist 已就緒({len(_ex['codes'])} 檔)→ 本次跳過")
+                _append_attempt_log(args.out, 'skip-already-ready', _finmind_latest, today)
+                return
         except Exception:
             pass
 
@@ -259,6 +278,7 @@ def main():
         feats = compute_branch_features(rows)
         if not feats:
             print(f'  WAIT 分點尚未公佈或無資料({today})→ 本次不產出 branch/stocklist,等下次排程重試')
+            _append_attempt_log(args.out, 'wait-not-published', _finmind_latest, today)
             return
         json.dump(feats, open(os.path.join(out_dir, 'branch.json'), 'w', encoding='utf-8'), ensure_ascii=False)
         print(f'  OK branch.json: {len(feats)} 檔特徵 — 分點就緒 @ {datetime.datetime.utcnow():%Y-%m-%d %H:%M} UTC')
@@ -273,6 +293,7 @@ def main():
                   open(os.path.join(out_dir, 'stocklist.json'), 'w', encoding='utf-8'),
                   ensure_ascii=False, indent=1)
         print(f'  stocklist.json: top-{args.top_n} → {sl}')
+        _append_attempt_log(args.out, 'produced', _finmind_latest, today)
     else:
         print('  分點層跳過(無 token 或無 syms-file)— 官方層已完成,客戶端融資券/處置/漲停價可用')
 
