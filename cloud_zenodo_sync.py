@@ -148,16 +148,35 @@ def _zget(url, token, binary=False, timeout=120):
     return r if binary else json.loads(r)
 
 
-def published_file_bytes(concept, name, token):
-    """從『最新已發佈版本』下載指定檔的內容(公開檔,可靠)。回 bytes 或 None(檔不存在=視為新檔)。
-    ★不要從 draft 下載繼承檔:未發佈草稿的檔案下載連結會 403(canary 踩到)。"""
+def _dl_record_file(url, timeout=180):
+    """下載『已發佈版本』的 metadata 或檔案內容。★兩個要點(canary#4 特徵截斷根因):
+    ① 公開端點『不帶 access_token』(帶 deposit token 會被 records API 擋 403)
+    ② 只送純 User-Agent,**不要送 accept: application/json**——檔案 /content 端點吃到會回錯 → 空。"""
     try:
-        rec = _zget(f'https://zenodo.org/api/records/{concept}/versions/latest', token)
+        # ★UA 要用 curl/python-urllib——Zenodo records API 會擋 'Mozilla/5.0'(Cloudflare bot 防護)回 403!
+        return urllib.request.urlopen(
+            urllib.request.Request(url, headers={'User-Agent': 'python-urllib/3'}), timeout=timeout).read()
+    except Exception as e:
+        log(f"  (下載失敗 {url[:60]}…:{e})")
+        return None
+
+
+def published_file_bytes(concept, name, token, version_id=None):
+    """從『最新已發佈版本』(或指定 version_id)下載指定檔內容。回 bytes 或 None(檔不存在=視為新檔)。
+    ★records API(metadata + 檔案內容)都是『公開』端點——**一律不帶 access_token**;帶了(deposit-scoped
+    token)會被 records API 擋成 403(canary#4 的特徵截斷根因)。"""
+    try:
+        _url = (f'https://zenodo.org/api/records/{version_id}' if version_id
+                else f'https://zenodo.org/api/records/{concept}/versions/latest')
+        rec = json.loads(_dl_record_file(_url) or b'{}')   # 無 token 取 metadata
         for f in rec.get('files', []):
             if f.get('key') == name:
                 _u = (f.get('links') or {}).get('self') or (f.get('links') or {}).get('download')
                 if _u:
-                    return _zget(_u, token, binary=True)
+                    _b = _dl_record_file(_u)
+                    if _b is None:
+                        log(f"  ⚠️ 取現有 {name} 下載回空(視為新檔,可能截斷歷史,請留意)")
+                    return _b
     except Exception as e:
         log(f"  (取現有 {name} 失敗,視為新檔續傳):{e}")
     return None
