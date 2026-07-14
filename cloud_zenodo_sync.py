@@ -256,22 +256,34 @@ def main():
     syms = [l.strip() for l in open(args.universe, encoding='utf-8') if l.strip()]
     log(f"目標 {len(dates)} 日:{dates[0]}~{dates[-1]} | universe {len(syms)} 檔 | {'上傳' if args.go else 'DRY-RUN'}")
 
-    # 逐日抓 → 累積(按月分組)
+    # 逐日抓 → 累積(按月分組)。★健壯性:任一資料源打嗝不得弄死整個(可能數小時的)job。
     packs_by_month = {}   # ym -> [lines]
     all_feats = {}        # 'sym|date' -> featdict
     san_lup = {}          # date -> {sym: lup}
     san_dispo = {}        # date -> [syms]
-    punish_snapshot = ccp.fetch_twse_punish()
+    # 處置快照:TWSE OpenAPI 偶爾回空 body → 重試 3 次;仍失敗就以空清單續跑(處置可日後補,別擋分點主資料)。
+    punish_snapshot = []
+    for _try in range(3):
+        try:
+            punish_snapshot = ccp.fetch_twse_punish() or []
+            if punish_snapshot: break
+            log(f"  處置快照回空(第{_try+1}次)…重試"); time.sleep(3)
+        except Exception as e:
+            log(f"  處置快照抓取失敗(第{_try+1}次):{e}"); time.sleep(3)
+    log(f"  處置快照:{len(punish_snapshot)} 筆(空=續跑,處置日後可補)")
     for ds in dates:
-        is_today = (ds == today)
-        lines, feats = branch_pack_and_feats(ftok, syms, ds)
-        if not lines:
-            log(f"  {ds}:分點空(非交易日/未公佈)→ skip"); continue
-        ym = ds[:7]; packs_by_month.setdefault(ym, []).extend(lines)
-        for sym, fv in feats.items(): all_feats[f'{sym}|{ds}'] = fv
-        san_lup[ds] = lup_map_for_date(ds, is_today)
-        san_dispo[ds] = dispo_on_date(punish_snapshot, ds)
-        log(f"  {ds}:分點 {len(lines):,} 列 / {len(feats)} 檔特徵 / 漲停 {len(san_lup[ds])} 檔 / 處置 {len(san_dispo[ds])} 檔")
+        try:
+            is_today = (ds == today)
+            lines, feats = branch_pack_and_feats(ftok, syms, ds)
+            if not lines:
+                log(f"  {ds}:分點空(非交易日/未公佈)→ skip"); continue
+            ym = ds[:7]; packs_by_month.setdefault(ym, []).extend(lines)
+            for sym, fv in feats.items(): all_feats[f'{sym}|{ds}'] = fv
+            san_lup[ds] = lup_map_for_date(ds, is_today)
+            san_dispo[ds] = dispo_on_date(punish_snapshot, ds)
+            log(f"  {ds}:分點 {len(lines):,} 列 / {len(feats)} 檔特徵 / 漲停 {len(san_lup[ds])} 檔 / 處置 {len(san_dispo[ds])} 檔")
+        except Exception as e:
+            log(f"  ⚠️ {ds} 處理失敗(跳過該日,不影響其他日):{e}")
 
     if not packs_by_month:
         log('本次無任何資料(全非交易日或未公佈)→ 結束'); return
