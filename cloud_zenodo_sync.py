@@ -163,13 +163,47 @@ def published_file_bytes(concept, name, token):
     return None
 
 
+def _find_existing_draft(concept, token):
+    """找該 concept 尚未發佈的草稿(前次失敗留下的)。回 dep dict 或 None。"""
+    import requests
+    p = {'access_token': token}
+    try:
+        # 該已發佈版的 links.latest_draft 若存在 = 有未發佈草稿
+        rec = requests.get(f'https://zenodo.org/api/deposit/depositions/{concept}', params=p).json()
+        _ld = (rec.get('links') or {}).get('latest_draft')
+        if _ld:
+            d = requests.get(_ld, params=p).json()
+            if d.get('id'):
+                return d
+    except Exception:
+        pass
+    try:  # 後備:列出自己所有 deposition,挑同 concept 的草稿
+        r = requests.get('https://zenodo.org/api/deposit/depositions',
+                         params={**p, 'size': 100, 'sort': '-mostrecent'})
+        if r.ok:
+            for d in r.json():
+                if str(d.get('conceptrecid')) == str(concept) and d.get('state') in ('unsubmitted', 'inprogress'):
+                    return d
+    except Exception:
+        pass
+    return None
+
+
 def zenodo_new_draft(concept, token):
-    """對 concept 開新版本草稿,回 (dep_id, bucket, files[])。"""
+    """對 concept 開新版本草稿,回 (dep_id, bucket, files[])。
+    ★若已有未發佈草稿(前次失敗留下),newversion 會回 400 → 改『重用既有草稿』,別再開新版。"""
     import requests
     p = {'access_token': token}
     r = requests.post(f'https://zenodo.org/api/deposit/depositions/{concept}/actions/newversion', params=p)
-    r.raise_for_status()
-    dep = requests.get(r.json()['links']['latest_draft'], params=p).json()
+    if r.status_code >= 400:
+        dep = _find_existing_draft(concept, token)
+        if dep is not None:
+            log(f"  (concept {concept} 已有未發佈草稿 → 重用,不再開新版)")
+        else:
+            r.raise_for_status()   # 其他 400 原因 → 照噴
+            dep = requests.get(r.json()['links']['latest_draft'], params=p).json()
+    else:
+        dep = requests.get(r.json()['links']['latest_draft'], params=p).json()
     return dep['id'], dep['links']['bucket'], dep.get('files', [])
 
 
