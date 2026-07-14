@@ -1,0 +1,61 @@
+# REMORA — 每日把最新資料(分點月包 + 特徵 + 散資料漲停/處置)自動上傳 Zenodo
+# 跑在 GitHub 雲端,你電腦關機也照跑。搬離原本靠本機 taskdeck 的每日鏈(那條會因電腦沒開而停）。
+#
+# 部署(一次性):
+#   1. 把 cloud_pipeline_deploy/ 內容放到你的 data repo(remora-data)根目錄。
+#   2. repo → Settings → Secrets and variables → Actions → New repository secret:
+#        FINMIND_TOKEN(你已經有)、ZENODO_TOKEN(從 OPT8d/.zenodo_token.txt 貼上)。
+#   3. push。之後每交易日自動跑;補齊某段用下方「Run workflow」填 start/end。
+name: daily-zenodo-sync
+
+on:
+  schedule:
+    # FinMind 分點約平日 21:00 後公佈(時間會變)→ 台北 23:00 起每 30 分探,抓到最新分點日就上傳(內建 skip)。
+    - cron: '0,30 15 * * 1-5'    # UTC 15:00/15:30 = 台北 23:00/23:30
+    - cron: '0,30 16 * * 1-5'    # UTC 16:00/16:30 = 台北 00:00/00:30
+    - cron: '30 1 * * 2-6'       # UTC 01:30 = 台北 隔日 09:30(盤前補跑保險)
+  workflow_dispatch:
+    inputs:
+      start:
+        description: '補齊起日 YYYY-MM-DD(留空=每日模式:自動抓 FinMind 最新分點日)'
+        required: false
+        default: ''
+      end:
+        description: '補齊迄日 YYYY-MM-DD(留空且有起日則=起日當天)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: zenodo-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350          # 補齊全月最壞情況(全市場×多日 FinMind 限速)留足時間
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+      - name: Install deps
+        run: pip install requests
+
+      - name: Sync to Zenodo
+        env:
+          FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
+          ZENODO_TOKEN: ${{ secrets.ZENODO_TOKEN }}
+          IN_START: ${{ github.event.inputs.start }}
+          IN_END: ${{ github.event.inputs.end }}
+        run: |
+          set -e
+          if [ -n "$IN_START" ]; then
+            END="${IN_END:-$IN_START}"
+            echo "=== 補齊模式:$IN_START ~ $END ==="
+            python cloud_zenodo_sync.py --start "$IN_START" --end "$END" --go
+          else
+            echo "=== 每日模式:FinMind 最新分點日 ==="
+            python cloud_zenodo_sync.py --latest --go
+          fi
