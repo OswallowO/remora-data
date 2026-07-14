@@ -152,13 +152,18 @@ def _dl_record_file(url, timeout=180):
     """下載『已發佈版本』的 metadata 或檔案內容。★兩個要點(canary#4 特徵截斷根因):
     ① 公開端點『不帶 access_token』(帶 deposit token 會被 records API 擋 403)
     ② 只送純 User-Agent,**不要送 accept: application/json**——檔案 /content 端點吃到會回錯 → 空。"""
-    try:
-        # ★UA 要用 curl/python-urllib——Zenodo records API 會擋 'Mozilla/5.0'(Cloudflare bot 防護)回 403!
-        return urllib.request.urlopen(
-            urllib.request.Request(url, headers={'User-Agent': 'python-urllib/3'}), timeout=timeout).read()
-    except Exception as e:
-        log(f"  (下載失敗 {url[:60]}…:{e})")
-        return None
+    # ★UA 要用 curl/python-urllib——Zenodo records API 會擋 'Mozilla/5.0'(Cloudflare bot 防護)回 403!
+    # 加重試:大檔偶爾 IncompleteRead(網路中斷)→ 重試,避免當成空檔而截斷歷史。
+    for _try in range(3):
+        try:
+            return urllib.request.urlopen(
+                urllib.request.Request(url, headers={'User-Agent': 'python-urllib/3'}), timeout=timeout).read()
+        except Exception as e:
+            if _try == 2:
+                log(f"  (下載失敗 {url[:60]}…:{e})")
+            else:
+                time.sleep(2)
+    return None
 
 
 def published_file_bytes(concept, name, token, version_id=None):
