@@ -36,9 +36,10 @@ UA = {'User-Agent': 'Mozilla/5.0', 'accept': 'application/json'}
 def log(m): print(f"[{time.strftime('%m-%d %H:%M:%S')}] {m}", flush=True)
 
 
-# FinMind 限速:sponsor 版 6000 req/hr → 0.66s/req ≈ 5450/hr(留 headroom,對齊本機 orchestrator)。
-# 補齊多日時這個很關鍵:太快會撞 FinMind 配額 → 回錯 → 資料破洞。可用 env FINMIND_INTERVAL 覆寫。
-_FM_INTERVAL = float(os.environ.get('FINMIND_INTERVAL', '0.66'))
+# FinMind 限速。canary 實測:光網路往返就 ~0.9s/檔 → 即使 sleep=0,實際速率僅 ~3900/hr(遠低於
+# sponsor 6000/hr),所以 sleep 不是瓶頸、可調小換取更短工時。0.15s → ~40min/天(原 0.66 要 63min/天)。
+# 仍留安全邊際;若日後 FinMind 回配額錯,調大此值。可用 env FINMIND_INTERVAL 覆寫。
+_FM_INTERVAL = float(os.environ.get('FINMIND_INTERVAL', '0.15'))
 _FM_BASE = 'https://api.finmindtrade.com/api/v4/data'
 
 
@@ -145,6 +146,21 @@ def _zget(url, token, binary=False, timeout=120):
     req = urllib.request.Request(f'{url}{sep}access_token={token}', headers=UA)
     r = urllib.request.urlopen(req, timeout=timeout).read()
     return r if binary else json.loads(r)
+
+
+def published_file_bytes(concept, name, token):
+    """從『最新已發佈版本』下載指定檔的內容(公開檔,可靠)。回 bytes 或 None(檔不存在=視為新檔)。
+    ★不要從 draft 下載繼承檔:未發佈草稿的檔案下載連結會 403(canary 踩到)。"""
+    try:
+        rec = _zget(f'https://zenodo.org/api/records/{concept}/versions/latest', token)
+        for f in rec.get('files', []):
+            if f.get('key') == name:
+                _u = (f.get('links') or {}).get('self') or (f.get('links') or {}).get('download')
+                if _u:
+                    return _zget(_u, token, binary=True)
+    except Exception as e:
+        log(f"  (取現有 {name} 失敗,視為新檔續傳):{e}")
+    return None
 
 
 def zenodo_new_draft(concept, token):
@@ -293,14 +309,12 @@ def main():
     # ── 上傳 Z2:分點月包(逐月)+ 特徵 json ──
     dep_id, bucket, dfiles = zenodo_new_draft(Z2_CONCEPT, ztok)
     for ym, lines in packs_by_month.items():
-        url, _ = _draft_file_url(dfiles, PACK_NAME(ym))
-        old = _zget(url, ztok, binary=True) if url else None
+        old = published_file_bytes(Z2_CONCEPT, PACK_NAME(ym), ztok)   # 從已發佈版下載(非 draft,免 403)
         merged, n = merge_pack(old, lines)
         lp = os.path.join(args.work, PACK_NAME(ym)); open(lp, 'wb').write(merged)
         log(f"  Z2 月包 {ym}:merge 後 {n:,} 列")
         zenodo_replace(dep_id, bucket, dfiles, PACK_NAME(ym), lp, ztok)
-    furl, _ = _draft_file_url(dfiles, FEAT_NAME)
-    fold = _zget(furl, ztok, binary=True) if furl else None
+    fold = published_file_bytes(Z2_CONCEPT, FEAT_NAME, ztok)
     fmerged, fn = merge_json_gz(fold, all_feats)
     flp = os.path.join(args.work, FEAT_NAME); open(flp, 'wb').write(fmerged)
     log(f"  Z2 特徵:merge 後 {fn:,} 筆(sym|date)")
@@ -310,8 +324,7 @@ def main():
 
     # ── 上傳 Z1:散資料(漲停 + 處置,以 date 為鍵 merge)──
     dep1, bucket1, dfiles1 = zenodo_new_draft(Z1_CONCEPT, ztok)
-    surl, _ = _draft_file_url(dfiles1, SAN_NAME)
-    sold = _zget(surl, ztok, binary=True) if surl else None
+    sold = published_file_bytes(Z1_CONCEPT, SAN_NAME, ztok)   # 從已發佈版下載(非 draft,免 403)
     san = {}
     if sold:
         try: san = json.loads(gzip.decompress(sold).decode('utf-8'))
