@@ -15,5 +15,5 @@
  "top_n": 10,
  "source": "cloud_chip_pipeline",
  "formula": "achip_a=z(nbr)+z(churn)+z(sutao)",
- "generated_at": "2026-07-27T17:05:41"
+ "generated_at": "2026-07-27T17:41:08"
 }
