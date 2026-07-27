@@ -23,7 +23,15 @@
   stocklist.json  明日自動 stocklist(achip top-N)— 需 branch.json
 
 用法:
-  py -3.10 services/cloud_chip_pipeline.py --out cloud_data [--token-env FINMIND_TOKEN] [--top-n 20]
+  py -3.10 cloud_chip_pipeline.py --out data [--token-env FINMIND_TOKEN] [--top-n 20]
+
+★★R12-2(2026-07-27):這一份是【唯一權威】。
+  原本 services/ 底下還有一份 243 行的舊複本(這一份 496 行),而且這段用法說明
+  本來就寫著「py -3.10 services/cloud_chip_pipeline.py」—— 指向舊的那份。
+  舊複本【缺少整套行情日期對帳】(match_quote_day / verified.json),
+  照著文件部署就等於把剛修好的「漲停價用錯日期」bug 原樣放回去。
+  → 舊複本已刪除(git 有歷史);部署一律以 cloud_pipeline_deploy/ 這一份為準,
+    步驟見 cloud_pipeline_deploy/部署步驟_20260727_修漲停價與公式.md。
 """
 import argparse, datetime, io, json, os, sys, time, urllib.parse, urllib.request
 
@@ -117,6 +125,46 @@ def _prev_jsons(out_root, today, name, k=6):
         return []
 
 
+def roc_to_iso(v):
+    """民國 YYYMMDD(如 '1150724')→ '2026-07-24';解析不了回 None。"""
+    t = str(v or '').strip()
+    if len(t) != 7 or not t.isdigit():
+        return None
+    try:
+        return '%04d-%s-%s' % (int(t[:3]) + 1911, t[3:5], t[5:7])
+    except Exception:
+        return None
+
+
+def quote_date_of(rows, field='Date'):
+    """這批行情【自己說】是哪一天。回 (日期, 佔比, 各日期筆數)。
+
+    ★★2026-07-28 重大更正:R11 的根因分析是【錯的】。
+      當時我在這支的註解寫著「STOCK_DAY_ALL 的回應【沒有日期欄位】」,
+      並據此做了一整套「靠反推前收與歷史 close.json 比對」的自我一致性守衛,
+      還寫下「穩定落後一天在數學上無法偵測」的結論。
+      實測(2026-07-28 00:53)兩個端點【都有 Date】:
+          TWSE STOCK_DAY_ALL        欄位含 'Date',值如 '1150724'
+          TPEx tpex_mainboard_quotes 欄位含 'Date',值如 '1150727'
+      → 完全不需要推論,直接讀就好。
+
+    ★而且讀了才發現問題比原本以為的更嚴重:那個時點
+      TWSE 是 07-24、TPEx 是 07-27 —— 【兩個端點不同天】,
+      而管線把它們合併成同一份 lup.json 並貼上「今天」的日期
+      → 那份漲停價是【兩個交易日的混合物】,不只是「落後一天」。
+    """
+    import collections as _c
+    cnt = _c.Counter()
+    for r in rows or []:
+        d = roc_to_iso(r.get(field))
+        if d:
+            cnt[d] += 1
+    if not cnt:
+        return None, 0.0, {}
+    top, n = cnt.most_common(1)[0]
+    return top, n / max(sum(cnt.values()), 1), dict(cnt)
+
+
 def compute_close_map(twse_rows, tpex_rows):
     """{sym: 當日收盤價}。存起來給【下一次執行】對帳用(見 quotes_are_lagged)。"""
     out = {}
@@ -179,7 +227,9 @@ def quotes_are_lagged(implied_prev, prev_close_map, min_common=100, need_ratio=0
     """判斷這次抓到的行情是不是【落後一個交易日】。
 
     ★2026-07-27 加。為什麼需要:
-      STOCK_DAY_ALL 的回應【沒有日期欄位】,管線拿到什麼就貼上今天的日期寫檔。
+      ⚠2026-07-28 更正:「STOCK_DAY_ALL 沒有日期欄位」是【錯的】——
+        兩個端點都有 Date(民國 YYYMMDD)。這段推論式守衛因此降為【備援】,
+        主判定改用端點自報的 Date(見 quote_date_of)。以下描述保留供理解舊設計。
       實測(客戶端側,cloud_data/2026-07-20/lup.json):
         228 檔裡 152 檔(66.7%)與券商來源不一致;
         反推它的「前收」= 2026-07-16 的收盤,而 07-20 的前一交易日是 07-17
@@ -250,11 +300,27 @@ def compute_branch_features(branch_rows):
     churn_r    = Σ min(買,賣) / 總買張(分點當沖比)
     top5_net_r = 淨買前 5 名合計 / 總買張
     dt_buy_avg = 淨買前 5 分點「買量加權均價」(套牢度分子)
-    nbr        = 分點列數(該股當日有交易的分點家數)"""
+    nbr        = 分點列數(該股當日有交易的分點家數)
+
+    ★R12-3(2026-07-27):原本逐檔 `except Exception: continue`,**沒有任何計數或日誌**
+      → 「這檔本來就沒有分點資料」與「算它的時候炸了」在輸出上長得一模一樣。
+      實測後果:branch.json 五天都恰好 228 檔(送進去 231 檔),固定少 3 檔,
+      而要查出那 3 檔為什麼不見,只能反過來比對歷史特徵庫 —— 管線自己什麼都沒說。
+      (查證結果:3383/5765 在歷史庫 509 天全是 null = FinMind 真的沒資料,跳過正確;
+       6806 停在 2026-06-22,原因待查 —— 有了下面這幾行就會直接印出來。)
+    ⚠ 另一個潛在分岔:本函式用 float(x or 0),而產出歷史特徵庫的
+      _archive/verify_historical/finmind_universe_fetch_v2.py 用 num()=float(str(v).replace(',','')).
+      對 '1,234' / '-' / 'N/A' 兩者行為不同(前者算得出來、後者【整檔丟掉】)。
+      兩份產物餵進同一個特徵庫。目前 FinMind 回的是數值型別所以沒踩到,
+      但一旦回傳格式變了,差別會是「整檔消失」而不是報錯 → 所以更需要下面的計數。
+    """
     feats = {}
+    _skip_thin = _skip_err = 0
+    _err_syms = []
     for sym, rows in branch_rows.items():
         try:
             if not rows or len(rows) < 3:
+                _skip_thin += 1
                 continue
             B = [(float(r.get('buy', 0) or 0), float(r.get('sell', 0) or 0),
                   float(r.get('price', 0) or 0)) for r in rows]
@@ -270,8 +336,20 @@ def compute_branch_features(branch_rows):
                 'dt_buy_avg': round(dt_buy_avg, 3),
                 'nbr': len(rows),
             }
-        except Exception:
+        except Exception as _e:
+            _skip_err += 1
+            if len(_err_syms) < 8:
+                _err_syms.append('%s(%s)' % (sym, type(_e).__name__))
             continue
+    # ★R12-3:把「少了幾檔、為什麼少」講出來。沉默的跳過會被當成正常運作。
+    if _skip_thin or _skip_err:
+        print('  branch 特徵:收到 %d 檔 → 產出 %d 檔;'
+              '跳過 分點列數<3 %d 檔 / 計算失敗 %d 檔%s'
+              % (len(branch_rows), len(feats), _skip_thin, _skip_err,
+                 ('  失敗例:' + ', '.join(_err_syms)) if _err_syms else ''))
+        if _skip_err:
+            print('  ⚠ 「計算失敗」不是「沒資料」—— 若持續出現同一批股號,'
+                  '很可能是 FinMind 回傳格式變了(例:千分位字串),需要修轉換而不是忽略。')
     return feats
 
 
@@ -398,9 +476,50 @@ def main():
 
     # 第一層b:全市場行情 → 當日漲停價 map(achip 套牢度分母;免 token)
     quotes_twse, quotes_tpex = fetch_twse_quotes(), fetch_tpex_quotes()
+
+    # ★★★2026-07-28 根因直接修:兩個端點【都有 Date 欄位】,直接讀,不用推論。
+    #   (R11 的註解寫「沒有日期欄位」是錯的 —— 見 quote_date_of 的說明。)
+    #   實測 2026-07-28 00:53:TWSE=2026-07-24、TPEx=2026-07-27 —— 【兩邊不同天】,
+    #   而原本的程式把它們直接合併成一份 lup.json 並貼上「今天」的日期
+    #   → 產出的漲停價是【兩個交易日的混合物】。
+    #   ⚠ 漲停價是 achip 套牢度的分母,混到不同天 = 選股直接錯,而且看不出來。
+    _qd_tw, _rt_tw, _all_tw = quote_date_of(quotes_twse)
+    _qd_tp, _rt_tp, _all_tp = quote_date_of(quotes_tpex)
+    print(f'  行情日期(端點自報):TWSE={_qd_tw}({_rt_tw:.0%}) '
+          f'TPEx={_qd_tp}({_rt_tp:.0%})')
+
+    # ① 兩邊不同天 → 【不混合】。只留與上市(筆數多、是主市場)同一天的上櫃列。
+    if _qd_tw and _qd_tp and _qd_tw != _qd_tp:
+        _n0 = len(quotes_tpex)
+        quotes_tpex = [r for r in quotes_tpex if roc_to_iso(r.get('Date')) == _qd_tw]
+        print(f'  ★兩個端點不同天(TWSE={_qd_tw} / TPEx={_qd_tp})→ '
+              f'只保留與 TWSE 同一天的上櫃列:{_n0} → {len(quotes_tpex)} 筆。'
+              f'【不混合不同交易日的行情】')
+
+    # ② 行情日期 ≠ 今天 → 【不是丟掉,是寫進它真正屬於的那一天】
+    #   ★2026-07-28 二修:第一版寫成「日期不符就不產出」,實測會變成【永遠不產出】——
+    #     TWSE 的 OpenAPI 在 07-28 00:56 還停在 07-24(TPEx 已是 07-27),
+    #     也就是它本來就穩定落後。「正確但永遠沒有資料」不是可用的設計。
+    #   ★關鍵認知:那批行情【對它自己那一天是正確的】,只是來得晚。
+    #     lup.json 的語意是「這一天的漲停價」,所以寫進 data/<行情日期>/ 才是對的;
+    #     客戶端本來就會往回找最近一份(≤12 天),所以它讀得到。
+    #   → 漲停價:寫進真正的日期資料夾(有用且正確)
+    #     stocklist:仍然只在【全部日期對齊】時才產(它同時吃 branch 與 lup,
+    #                兩者不同天就不該合成一份清單)
+    _qdate = _qd_tw or _qd_tp
+    _date_ok = (_qdate == today)
+    if _qdate and not _date_ok:
+        out_dir = os.path.join(args.out, _qdate)
+        os.makedirs(out_dir, exist_ok=True)
+        print(f'  ★行情日期 {_qdate} ≠ 執行日 {today} —— 端點尚未更新當日彙總。')
+        print(f'    → lup.json 改寫進【它真正屬於的日期】 data/{_qdate}/(資料本身是對的,只是來得晚)')
+        print(f'    → stocklist 仍不產出(它同時吃 branch 與 lup,不同天不該合成)')
+    elif not _qdate:
+        print(f'  ⚠ 兩個端點都讀不到 Date 欄位 → 退回舊的自我一致性對帳(見下)。')
+
     lup_map = compute_lup_map(quotes_twse, quotes_tpex)
 
-    # ★2026-07-27 行情日期對帳:端點沒有日期欄位,拿到哪一天就貼上今天的日期寫檔。
+    # ★2026-07-27 行情日期對帳(★2026-07-28 降為備援:端點其實有 Date 欄位)。
     #   正確關係 =「這批行情反推的前收」必須等於「上一個交易日的收盤」。
     #   對不上 → 行情落後 → 【不產出】,等下次排程重試。
     #   寧可今天沒有雲端清單(客戶端本來就會自動退回本機重算),
@@ -425,7 +544,7 @@ def main():
               ensure_ascii=False)
 
     # ★★這道守衛【能做到什麼、做不到什麼】(踩了兩次錯設計才想清楚,寫下來):
-    #   端點沒有日期欄位時,「穩定落後一天」在數學上【無法】只靠自我一致性偵測 ——
+    #   【只在讀不到 Date 時才用】。沒有日期欄位時,「穩定落後一天」在數學上無法只靠自我一致性偵測 ——
     #   因為「每天都晚一天」與「每天都正確」產生的資料在內部完全一致。
     #   能可靠證明的只有一件事:【這批資料比我已經有的還舊】。
     #   所以判定只有三種,絕不擴張:
@@ -433,7 +552,43 @@ def main():
     #     · 對到最新       → 放行
     #     · 對不到任何一天 → 【不知道】→ 放行但示警
     #       (第二版把這種當成擋下,結果任何資料缺口之後都會把好資料擋掉 = 誤擋)
-    if _thin:
+    # ★★★2026-07-28:端點【自報的日期】是直接證據,優先於下面的自我一致性推論。
+    #   有 Date 就用 Date 判定;讀不到 Date 才退回舊的 match_quote_day。
+    #   (舊那套是在「以為端點沒有日期」的錯誤前提下做的 —— 留著當備援,
+    #    因為端點欄位哪天又改了,至少還有一條路。)
+    if _qdate:
+        if not _date_ok:
+            # 漲停價寫進真正的日期(上面已把 out_dir 換過去),然後結束 ——
+            # branch/stocklist 那兩層需要「今天的」分點資料,跟這批舊行情對不起來。
+            json.dump(lup_map, open(os.path.join(out_dir, 'lup.json'), 'w', encoding='utf-8'),
+                      ensure_ascii=False)
+            print(f'  lup.json → data/{_qdate}/({len(lup_map)} 檔漲停價,'
+                  f'上市 {len(quotes_twse)} + 上櫃 {len(quotes_tpex)} 行情)')
+            try:
+                json.dump({'date': _qdate, 'quote_date': _qdate, 'run_date': today,
+                           'source': 'endpoint Date field(直接判定,非推論)',
+                           'twse_date': _qd_tw, 'tpex_date': _qd_tp,
+                           'note': '行情晚到:寫進它真正屬於的日期;stocklist 未產出',
+                           'checked_at': datetime.datetime.now().isoformat(timespec='seconds')},
+                          open(os.path.join(out_dir, 'verified.json'), 'w', encoding='utf-8'),
+                          ensure_ascii=False, indent=1)
+            except Exception:
+                pass
+            _append_attempt_log(args.out,
+                                f'quote-late(endpoint={_qdate}, run={today}) → lup 已寫進 {_qdate}',
+                                _finmind_latest, today)
+            return
+        print(f'  ✔ 行情日期直接判定:端點自報 {_qdate} = 目標日期 → 產出')
+        try:
+            json.dump({'date': today, 'quote_date': _qdate,
+                       'source': 'endpoint Date field(直接判定,非推論)',
+                       'twse_date': _qd_tw, 'tpex_date': _qd_tp,
+                       'checked_at': datetime.datetime.now().isoformat(timespec='seconds')},
+                      open(os.path.join(out_dir, 'verified.json'), 'w', encoding='utf-8'),
+                      ensure_ascii=False, indent=1)
+        except Exception as _e_vf2:
+            print(f'  (verified.json 寫入失敗,不致命:{_e_vf2})')
+    elif _thin:
         print('  行情日期對帳:沒有足夠的歷史收盤可比(第一次執行 / 樣本太少)→ 本次略過檢查')
     elif _match is None:
         print(f'  WARN 行情反推前收對不上最近 {len(_prevs)} 份收盤的任何一份'
@@ -475,6 +630,22 @@ def main():
             _append_attempt_log(args.out, 'wait-not-published', _finmind_latest, today)
             return
         json.dump(feats, open(os.path.join(out_dir, 'branch.json'), 'w', encoding='utf-8'), ensure_ascii=False)
+        # ★R12-1(2026-07-27):branch.json 是【公式的產物】,卻沒有任何版本/公式標記。
+        #   stocklist.json 有 formula 欄位 —— 當初能抓到「雲端跑的是 2z(nbr) 不是定版 A 式」
+        #   就是靠它。branch.json 沒有對應的東西,所以特徵定義一改,
+        #   舊檔會靜默混進客戶端的特徵庫,而且【沒有任何檢查抓得到】。
+        #   ⚠ 不把 meta 塞進 branch.json 內部:客戶端把它整個當 {股號: 特徵} 迭代,
+        #     加保留鍵是破壞性變更。改寫【旁邊一個獨立檔】,舊客戶端完全不受影響。
+        try:
+            json.dump({'formula': 'branch_v2=churn_r|top5_net_r|dt_buy_avg|nbr',
+                       'impl': 'compute_branch_features',
+                       'date': today,
+                       'n_in': len(rows), 'n_out': len(feats),
+                       'generated_at': datetime.datetime.now().isoformat(timespec='seconds')},
+                      open(os.path.join(out_dir, 'branch_meta.json'), 'w', encoding='utf-8'),
+                      ensure_ascii=False, indent=1)
+        except Exception as _e_bm:
+            print(f'  (branch_meta.json 寫入失敗,不致命:{_e_bm})')
         print(f'  OK branch.json: {len(feats)} 檔特徵 — 分點就緒 @ {datetime.datetime.utcnow():%Y-%m-%d %H:%M} UTC')
 
         # 第三層:自動 stocklist(achip top-N;字母序 = 客戶端引擎 day_stocks 順序)
