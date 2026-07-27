@@ -365,14 +365,26 @@ def main():
 
     # 重試友善:排程(無 --date)時,若今日 stocklist 已就緒(codes 非空)→ 直接跳過,
     # 不重抓、不蓋掉好資料。供「每 10 分排程重試直到分點公佈」用。
+    # ★★2026-07-27 修:「已就緒」不能只看【檔案在不在】,還要看【那次產出是否通過行情日期對帳】。
+    #   實測踩到:台北 17:02 手動跑了一次(TWSE 每日彙總要晚上才發布,所以排程訂在 22:30~00:00),
+    #   拿到的是【前一個交易日】的行情 → lup 反推基準對到 2026-07-23 而非 07-24(66.7% vs 36.8%)。
+    #   那次是第一次執行、沒有 close.json 基準,守衛依設計略過檢查 → 錯資料就寫出去了。
+    #   而舊的 skip 條件只看 stocklist.json 存不存在 → 今晚排程會【整天跳過】,
+    #   那份錯的漲停價就永遠留著。
+    #   → 一次太早的執行足以【永久毒化】那一天。
+    #   修法:只有通過日期對帳的那次會寫 verified.json;skip 必須兩者皆備。
     _sl_path = os.path.join(out_dir, 'stocklist.json')
+    _vf_path = os.path.join(out_dir, 'verified.json')
     if (not args.date) and os.path.exists(_sl_path):
         try:
             _ex = json.load(open(_sl_path, encoding='utf-8'))
-            if _ex.get('codes'):
-                print(f"  OK {today} stocklist 已就緒({len(_ex['codes'])} 檔)→ 本次跳過")
+            if _ex.get('codes') and os.path.exists(_vf_path):
+                print(f"  OK {today} stocklist 已就緒({len(_ex['codes'])} 檔)且行情日期已對帳 → 本次跳過")
                 _append_attempt_log(args.out, 'skip-already-ready', _finmind_latest, today)
                 return
+            if _ex.get('codes'):
+                print(f"  REDO {today} stocklist 存在但【沒有 verified.json】"
+                      f"(= 產出時行情日期未通過對帳)→ 本次重做,不跳過")
         except Exception:
             pass
 
@@ -439,6 +451,16 @@ def main():
         return
     else:
         print(f'  行情日期對帳:反推前收 {_hit}/{_common} 檔 = {_match} 收盤 → 行情是今天的 OK')
+        # ★只有【通過對帳】才寫 verified.json —— 上面的 skip 條件靠它判斷
+        #   「這一天已經有可信的產出了」。沒通過(略過檢查/落後/對不到)就不寫,
+        #   下次排程才會重做,不會被一次太早的執行永久卡住。
+        try:
+            json.dump({'date': today, 'matched': _match, 'hit': _hit, 'common': _common,
+                       'checked_at': datetime.datetime.now().isoformat(timespec='seconds')},
+                      open(os.path.join(out_dir, 'verified.json'), 'w', encoding='utf-8'),
+                      ensure_ascii=False, indent=1)
+        except Exception as _e_vf:
+            print(f'  (verified.json 寫入失敗,不致命:{_e_vf})')
     json.dump(lup_map, open(os.path.join(out_dir, 'lup.json'), 'w', encoding='utf-8'), ensure_ascii=False)
     print(f'  lup.json: {len(lup_map)} 檔漲停價(上市 {len(quotes_twse)} + 上櫃 {len(quotes_tpex)} 行情)')
 
