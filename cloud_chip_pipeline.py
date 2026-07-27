@@ -91,6 +91,119 @@ def _num(x):
         return 0.0
 
 
+def _prev_jsons(out_root, today, name, k=6):
+    """回「早於 today 的最近 k 份 <name>」,由新到舊:[(日期, 內容), ...]。
+
+    ★2026-07-27 第二版:原本只取【最近一份】,那會讓守衛把自己鎖死 ——
+      守衛一旦擋下某天就不產出、也就不寫 close.json;隔天比對的仍是更舊那份,
+      於是又對不上、又擋下……永遠解不開。
+      改成在最近幾天的收盤裡找「對到哪一天」:
+        對到 D-1 → 行情是今天的
+        對到更舊 → 知道落後幾天(而且下次仍比得到,不會卡死)
+    """
+    try:
+        days = sorted((d for d in os.listdir(out_root)
+                       if len(d) == 10 and d[4] == '-' and d < today
+                       and os.path.exists(os.path.join(out_root, d, name))), reverse=True)[:k]
+        out = []
+        for d in days:
+            try:
+                with open(os.path.join(out_root, d, name), encoding='utf-8') as f:
+                    out.append((d, json.load(f)))
+            except Exception:
+                pass
+        return out
+    except Exception:
+        return []
+
+
+def compute_close_map(twse_rows, tpex_rows):
+    """{sym: 當日收盤價}。存起來給【下一次執行】對帳用(見 quotes_are_lagged)。"""
+    out = {}
+    for r in twse_rows or []:
+        c = _num(r.get('ClosingPrice'))
+        s = str(r.get('Code', '')).strip()
+        if s and c > 0:
+            out[s] = c
+    for r in tpex_rows or []:
+        c = _num(r.get('Close'))
+        s = str(r.get('SecuritiesCompanyCode', '')).strip()
+        if s and c > 0:
+            out.setdefault(s, c)
+    return out
+
+
+def implied_prev_close(twse_rows, tpex_rows):
+    """{sym: 反推的前一日收盤} = Close − Change(與 compute_lup_map 用的是同一個推法)。"""
+    out = {}
+    for r in twse_rows or []:
+        c, ch = _num(r.get('ClosingPrice')), _num(r.get('Change'))
+        s = str(r.get('Code', '')).strip()
+        if s and c > 0:
+            out[s] = c - ch
+    for r in tpex_rows or []:
+        c, ch = _num(r.get('Close')), _num(r.get('Change'))
+        s = str(r.get('SecuritiesCompanyCode', '')).strip()
+        if s and c > 0:
+            out.setdefault(s, c - ch)
+    return out
+
+
+def match_quote_day(implied_prev, prev_list, min_common=100, need_ratio=0.80):
+    """這批行情的「前收」對到 prev_list 裡的哪一天?
+
+    prev_list = [(日期, {sym: 收盤}), ...] 由新到舊。
+    回 (對到的日期 or None, 對上的檔數, 共同檔數, 是否樣本不足)。
+
+    ★用「對到哪一天」取代「跟最近一份像不像」的理由:
+      後者會讓守衛自我鎖死(擋下 → 不寫 close.json → 隔天比更舊的 → 又擋下)。
+      前者不論被擋幾天都還比得到,而且直接告訴你落後幾天。
+    """
+    best = (None, 0, 0)
+    thin = True
+    for d, cmap in prev_list:
+        common = [s for s in implied_prev if s in cmap]
+        if len(common) < min_common:
+            continue
+        thin = False
+        hit = sum(1 for s in common
+                  if abs(float(implied_prev[s]) - float(cmap[s])) < 0.005)
+        if hit > best[1]:
+            best = (d, hit, len(common))
+        if hit / len(common) >= need_ratio:
+            return d, hit, len(common), False
+    return None, best[1], best[2], thin
+
+
+def quotes_are_lagged(implied_prev, prev_close_map, min_common=100, need_ratio=0.80):
+    """判斷這次抓到的行情是不是【落後一個交易日】。
+
+    ★2026-07-27 加。為什麼需要:
+      STOCK_DAY_ALL 的回應【沒有日期欄位】,管線拿到什麼就貼上今天的日期寫檔。
+      實測(客戶端側,cloud_data/2026-07-20/lup.json):
+        228 檔裡 152 檔(66.7%)與券商來源不一致;
+        反推它的「前收」= 2026-07-16 的收盤,而 07-20 的前一交易日是 07-17
+        → 它拿到的是【07-17 那一列行情】,卻被寫進 07-20 的資料夾。
+      而漲停價是 achip 套牢度的【分母】→ 選股直接被改掉。
+      ⚠ 檔位算法本身沒問題:與客戶端 calculate_limit_up_price 對 20 萬個價格 0 不一致,
+        所以【唯一】的錯就是「用了哪一天的收盤價」。
+
+    ★為什麼不是比對「與前一份 lup 像不像」:我先做過那個版本,實測擋不住 ——
+      相鄰兩份雲端 lup 只有 4~10% 相同,因為快照【每天都有前進】,
+      只是穩定落後一天。所以要比的不是「有沒有變」,而是「對不對得上」。
+
+    正確關係:今天這批行情反推出來的「前收」,應該等於【上一個交易日收盤】。
+    對得上 → 行情是今天的;對不上(多半會對到再前一天)→ 落後。
+    回 (是否落後, 對上的檔數, 共同檔數)。
+    """
+    common = [s for s in implied_prev if s in prev_close_map]
+    if len(common) < min_common:
+        return False, 0, len(common)          # 樣本太少不下判斷(寧可放行,不誤擋)
+    hit = sum(1 for s in common
+              if abs(float(implied_prev[s]) - float(prev_close_map[s])) < 0.005)
+    return (hit / len(common)) < need_ratio, hit, len(common)
+
+
 def compute_lup_map(twse_rows, tpex_rows):
     """當日漲停價 map {sym: lup}:前收 = Close − Change,lup = floor_tick(前收 × 1.10)。
     (achip 的套牢度分母 = 特徵同日的漲停價,與 分點籌碼_全市場特徵v2 的回測用法一致)"""
@@ -163,7 +276,7 @@ def compute_branch_features(branch_rows):
 
 
 def achip_stocklist(feats, lup_map, top_n=20):
-    """④ achip 排名:2×z(nbr) + z(churn_r) + z(dt_buy_avg/漲停價) → top-N
+    """④ achip 排名(A 原式,2026-07-26 定版):z(nbr) + z(churn_r) + z(dt_buy_avg/前一日漲停價) → top-N
     (公式對齊 交易程式 _build_chip_diff_branch achip 模式)"""
     base = {s: m for s, m in feats.items() if lup_map.get(s, 0) > 0}
     if not base: return []
@@ -175,7 +288,14 @@ def achip_stocklist(feats, lup_map, top_n=20):
     zs = z({s: m['dt_buy_avg'] / lup_map[s] for s, m in base.items()})
     zn = z({s: m.get('nbr', 0.0) for s, m in base.items()})
     zh = z({s: m.get('churn_r', 0.0) for s, m in base.items()})
-    ranked = sorted(((s, zn[s] + 2.0 * zs[s]) for s in base), key=lambda t: -t[1])
+    # ★2026-07-26 修:這裡原本寫 zn + 2*zs —— 那是 _ACHIP_FORMULAS['now'],
+    #   正是 2.2.2 因為「五分位 Q4/Q5 反轉」而【刻意換掉】的那一式,
+    #   churn(zh)算了卻完全沒用到。而 live 走的是雲端清單(路徑①優先),
+    #   等於「回測用 a 算出權威數字、真錢下的是 now 選的股」——
+    #   client 端的 chip_achip_formula='a' 與開機正典自檢對這條路完全管不到,
+    #   綠燈綠得毫無意義。這是 achip 靜默退化家族的第四次。
+    #   實測 07-24:a 與 now 的 top-10 只重疊 6/10(最差 07-20 只有 4/10)。
+    ranked = sorted(((s, zn[s] + zh[s] + zs[s]) for s in base), key=lambda t: -t[1])
     return [s for s, _ in ranked[:top_n]]
 
 
@@ -267,6 +387,58 @@ def main():
     # 第一層b:全市場行情 → 當日漲停價 map(achip 套牢度分母;免 token)
     quotes_twse, quotes_tpex = fetch_twse_quotes(), fetch_tpex_quotes()
     lup_map = compute_lup_map(quotes_twse, quotes_tpex)
+
+    # ★2026-07-27 行情日期對帳:端點沒有日期欄位,拿到哪一天就貼上今天的日期寫檔。
+    #   正確關係 =「這批行情反推的前收」必須等於「上一個交易日的收盤」。
+    #   對不上 → 行情落後 → 【不產出】,等下次排程重試。
+    #   寧可今天沒有雲端清單(客戶端本來就會自動退回本機重算),
+    #   也不要產出一份「頂著今天日期的昨天資料」讓真錢照著它選股。
+    _close_map = compute_close_map(quotes_twse, quotes_tpex)
+    _impl_prev = implied_prev_close(quotes_twse, quotes_tpex)
+    _prevs = _prev_jsons(args.out, today, 'close.json')
+    _newest = _prevs[0][0] if _prevs else None
+    _match, _hit, _common, _thin = match_quote_day(_impl_prev, _prevs)
+
+    # ★★【無論放行或擋下,都要寫 close.json】—— 這是不自我鎖死的關鍵。
+    #   第一版只在放行時寫,結果:擋一次 → 沒寫 → 隔天比到更舊的那份 → 又擋 → 永久鎖死。
+    #   為什麼寫在 today 目錄是對的(即使這批行情其實是昨天的):
+    #     D 天拿到 D-1 的行情 → 存 close.json[D] = close(D-1)
+    #     D+1 天端點恢復、拿到 D 的行情 → 反推前收 = close(D-1)
+    #       → 對上剛存的 close.json[D],而且它是最新 → 放行 ✔ 自動恢復
+    #     D+1 天端點仍落後、又拿到 D-1 的行情 → 反推前收 = close(D-2)
+    #       → 對到更舊那份、不是最新 → 繼續擋 ✔ 仍然正確
+    #   也就是說 close.json 記的是「這次抓到什麼」,不是「今天的官方收盤」——
+    #   它的用途只有一個:給下一次比對用的參照點。
+    json.dump(_close_map, open(os.path.join(out_dir, 'close.json'), 'w', encoding='utf-8'),
+              ensure_ascii=False)
+
+    # ★★這道守衛【能做到什麼、做不到什麼】(踩了兩次錯設計才想清楚,寫下來):
+    #   端點沒有日期欄位時,「穩定落後一天」在數學上【無法】只靠自我一致性偵測 ——
+    #   因為「每天都晚一天」與「每天都正確」產生的資料在內部完全一致。
+    #   能可靠證明的只有一件事:【這批資料比我已經有的還舊】。
+    #   所以判定只有三種,絕不擴張:
+    #     · 對到的不是最新 → 可【證明】變舊 → 擋下(這正好抓住「開始落後」的那一天)
+    #     · 對到最新       → 放行
+    #     · 對不到任何一天 → 【不知道】→ 放行但示警
+    #       (第二版把這種當成擋下,結果任何資料缺口之後都會把好資料擋掉 = 誤擋)
+    if _thin:
+        print('  行情日期對帳:沒有足夠的歷史收盤可比(第一次執行 / 樣本太少)→ 本次略過檢查')
+    elif _match is None:
+        print(f'  WARN 行情反推前收對不上最近 {len(_prevs)} 份收盤的任何一份'
+              f'(最佳 {_hit}/{_common})—— 可能是中間有交易日沒跑到。')
+        print('     【不擋】:對不上只代表不知道,不代表變舊;擋下會把好資料誤殺。')
+        _append_attempt_log(args.out, f'quotes-unmatched(best {_hit}/{_common})',
+                            _finmind_latest, today)
+    elif _match != _newest:
+        print(f'  LAGGED 行情落後:反推前收對到 {_match} 的收盤,而最新一份是 {_newest}'
+              f'({_hit}/{_common})→ 這批行情不是 {today} 的')
+        print('  → 本次【不產出】lup.json / stocklist.json,等下次排程重試。')
+        print('     若確認今天不是交易日,這就是預期行為。')
+        _append_attempt_log(args.out, f'lagged-quotes(matched {_match}, newest {_newest})',
+                            _finmind_latest, today)
+        return
+    else:
+        print(f'  行情日期對帳:反推前收 {_hit}/{_common} 檔 = {_match} 收盤 → 行情是今天的 OK')
     json.dump(lup_map, open(os.path.join(out_dir, 'lup.json'), 'w', encoding='utf-8'), ensure_ascii=False)
     print(f'  lup.json: {len(lup_map)} 檔漲停價(上市 {len(quotes_twse)} + 上櫃 {len(quotes_tpex)} 行情)')
 
@@ -288,7 +460,7 @@ def main():
         # 找最近一份(≤12 天)並驗新鮮度
         sl = sorted(achip_stocklist(feats, lup_map, args.top_n))
         json.dump({'date': today, 'codes': sl, 'top_n': args.top_n,
-                   'source': 'cloud_chip_pipeline', 'formula': 'achip=2z(nbr)+z(churn)+z(sutao)',
+                   'source': 'cloud_chip_pipeline', 'formula': 'achip_a=z(nbr)+z(churn)+z(sutao)',
                    'generated_at': datetime.datetime.now().isoformat(timespec='seconds')},
                   open(os.path.join(out_dir, 'stocklist.json'), 'w', encoding='utf-8'),
                   ensure_ascii=False, indent=1)
