@@ -87,9 +87,36 @@ def _num(x):
 
 
 def lup_map_for_date(date_str, is_today):
-    """回 {sym: 漲停價}。今天→用 OpenAPI STOCK_DAY_ALL(live);歷史→TWSE MI_INDEX?date=。"""
+    """回 {sym: 漲停價}。今天→用 OpenAPI STOCK_DAY_ALL(live);歷史→TWSE MI_INDEX?date=。
+
+    ★★2026-07-28 重大修正(客戶端 R65 逐檔比對交易所日報才抓到)
+      原本 is_today 這條路【直接把端點回來的東西當成 date_str 那天的】,完全沒看端點自報的
+      Date —— 而 TWSE 的 OpenAPI 是穩定落後的:2026-07-27 執行時它還停在 07-24。
+      後果:07-24 的漲停價被貼上 2026-07-27 的標籤、上傳 Zenodo、客戶端照單全收。
+      實測(用交易所自己的日報 Close/Change 當真值):
+          雲端 lup.json(有驗日期)  1359/1359 = 100.0% 正確
+          Zenodo 那份(本函式產的)   134/1359 =   9.9% 正確
+      而漲停價是 achip 套牢度的【分母】→ 選股直接被改掉:客戶端用它重算出來的
+      stocklist 與雲端的正確清單只重疊 6/10,還因為 stocklist_cloud_prefer_local
+      反過來把正確的清單覆蓋掉。這是「錯得很安靜、但直接決定當天買什麼」的形狀。
+
+      同一個 bug 今天已經在 cloud_chip_pipeline 修過(改讀端點自報 Date),
+      但這支【沒有一起修】—— 而 Zenodo 這份在客戶端的優先序還比 lup.json 高。
+      → 這裡採同一原則:端點自己說不是這一天,就【不產出】。
+        寧可那天沒有漲停價(歷史路徑之後會補上正確的),也不要貼錯標籤。
+    """
     if is_today:
-        return ccp.compute_lup_map(ccp.fetch_twse_quotes(), ccp.fetch_tpex_quotes())
+        _tw, _tp = ccp.fetch_twse_quotes(), ccp.fetch_tpex_quotes()
+        _dtw, _rtw, _ = ccp.quote_date_of(_tw)
+        _dtp, _rtp, _ = ccp.quote_date_of(_tp)
+        if _dtw and _dtw != date_str:
+            log(f'  ★TWSE 端點自報 {_dtw} ≠ 目標 {date_str}(端點落後)→ 今日漲停價不產出,'
+                f'留給歷史路徑(MI_INDEX?date=)之後補正確的')
+            return {}
+        if _dtp and _dtp != date_str:
+            log(f'  ★TPEx 端點自報 {_dtp} ≠ 目標 {date_str} → 只用上市部分,不混不同天')
+            _tp = []
+        return ccp.compute_lup_map(_tw, _tp)
     ymd = date_str.replace('-', '')
     lup = {}
     # TWSE 歷史全市場(MI_INDEX ALLBUT0999)回多張 tables;個股表 = 同時含「證券代號」+「收盤價」的那張。
@@ -338,7 +365,9 @@ def main():
     punish_snapshot = []
     for _try in range(3):
         try:
-            punish_snapshot = ccp.fetch_twse_punish() or []
+            # ★R66:原本只有上市 → Zenodo 那包也只有上市,而客戶端註解卻寫著
+            #   「TPEx 待 Zenodo 包覆寫」→ 承諾的升級永遠不會發生。上櫃一起抓。
+            punish_snapshot = (ccp.fetch_twse_punish() or []) + (ccp.fetch_tpex_punish() or [])
             if punish_snapshot: break
             log(f"  處置快照回空(第{_try+1}次)…重試"); time.sleep(3)
         except Exception as e:

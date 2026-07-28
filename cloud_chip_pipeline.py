@@ -51,8 +51,44 @@ def fetch_twse_margin():
 
 
 def fetch_twse_punish():
-    """① 處置股(官方 OpenAPI)"""
+    """① 處置股(官方 OpenAPI)—— ⚠ 只有【上市】。上櫃要另外抓 fetch_tpex_punish()。"""
     return _get_json('https://openapi.twse.com.tw/v1/announcement/punish')
+
+
+def fetch_tpex_punish():
+    """①b 處置股【上櫃】(TPEx 公告)。
+
+    ★★2026-07-28 R66 補上:原本整條管線只抓 TWSE,punish.json 因此【只有上市】。
+      客戶端把它併進 disposition_stocks_dict 時留了一句
+      「TPEx 待 Zenodo 包以較完整者覆寫」—— 但 Zenodo 那包
+      (cloud_zenodo_sync)用的是【同一個 TWSE-only 端點】,承諾的升級永遠不會發生。
+      實測(用當日窗口重查 TWSE+TPEx 當真值):2026-07-17~07-23 每天漏 12~30 檔,
+      漏掉的 100% 都是上櫃;其中 5 天共 7 檔次落在族群交易範圍內
+      → 回測不會排除它們 = 進到處置股 = 帳面虛胖。
+
+    回傳格式刻意對齊 TWSE OpenAPI(Code / DispositionPeriod),
+    這樣客戶端既有的解析器不用改就吃得下,punish.json 也向後相容。
+    ⚠ TPEx 這個端點的 d 參數實際被忽略,每次都回「當前公告清單」——
+      所以它只保證涵蓋現在還在公告中的期間,歷史要靠每日快照累積。
+    """
+    import re as _re
+    out = []
+    try:
+        now = datetime.date.today()
+        d = f"{now.year - 1911}/{now.strftime('%m/%d')}"
+        j = _get_json('https://www.tpex.org.tw/web/bulletin/disposal_information/'
+                      f'disposal_information_result.php?l=zh-tw&d={d}&o=json')
+        per = _re.compile(r'(\d{2,3}/\d{1,2}/\d{1,2}\s*[~～\-－]\s*\d{2,3}/\d{1,2}/\d{1,2})')
+        for tb in (j.get('tables') or []):
+            for row in (tb.get('data') or []):
+                code = next((str(c).strip() for c in row
+                             if _re.fullmatch(r'\d{4,6}', str(c).strip())), None)
+                pstr = next((per.search(str(c)).group(1) for c in row if per.search(str(c))), None)
+                if code and pstr:
+                    out.append({'Code': code, 'DispositionPeriod': pstr, 'Market': 'TPEx'})
+    except Exception as e:
+        print(f'[TPEx punish] 失敗(非致命,但當日上櫃處置會缺): {e}')
+    return out
 
 
 def fetch_tpex_margin():
@@ -470,9 +506,12 @@ def main():
     margin = {'twse': fetch_twse_margin(), 'tpex': fetch_tpex_margin()}
     json.dump(margin, open(os.path.join(out_dir, 'margin.json'), 'w', encoding='utf-8'), ensure_ascii=False)
     print(f'  margin.json: 上市 {len(margin["twse"])} + 上櫃 {len(margin["tpex"])} 筆')
-    punish = fetch_twse_punish()
+    # ★R66:上市 + 上櫃都要。只有上市 = 客戶端回測漏排除上櫃處置股(實測每天漏 12~30 檔)。
+    _pun_tw = fetch_twse_punish() or []
+    _pun_tp = fetch_tpex_punish() or []
+    punish = list(_pun_tw) + list(_pun_tp)
     json.dump(punish, open(os.path.join(out_dir, 'punish.json'), 'w', encoding='utf-8'), ensure_ascii=False)
-    print(f'  punish.json: {len(punish)} 筆')
+    print(f'  punish.json: {len(punish)} 筆(上市 {len(_pun_tw)} + 上櫃 {len(_pun_tp)})')
 
     # 第一層b:全市場行情 → 當日漲停價 map(achip 套牢度分母;免 token)
     quotes_twse, quotes_tpex = fetch_twse_quotes(), fetch_tpex_quotes()
