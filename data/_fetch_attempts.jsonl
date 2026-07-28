@@ -117,3 +117,4 @@
 {"utc": "2026-07-28 16:17:55", "taipei": "2026-07-29 00:17:55", "finmind_latest": "2026-07-28", "target": "2026-07-28", "status": "quote-late(endpoint=2026-07-27, run=2026-07-28) → lup 已寫進 2026-07-27"}
 {"utc": "2026-07-28 16:44:39", "taipei": "2026-07-29 00:44:39", "finmind_latest": "2026-07-28", "target": "2026-07-28", "status": "quote-late(endpoint=2026-07-27, run=2026-07-28) → lup 已寫進 2026-07-27"}
 {"utc": "2026-07-28 17:22:09", "taipei": "2026-07-29 01:22:09", "finmind_latest": "2026-07-28", "target": "2026-07-28", "status": "quote-late(endpoint=2026-07-27, run=2026-07-28) → lup 已寫進 2026-07-27"}
+{"utc": "2026-07-28 22:33:20", "taipei": "2026-07-29 06:33:20", "finmind_latest": "2026-07-28", "target": "2026-07-28", "status": "produced"}
