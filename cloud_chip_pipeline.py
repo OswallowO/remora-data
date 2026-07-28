@@ -466,6 +466,9 @@ def main():
     # 改問 FinMind「現在最新有分點的是哪天」就抓那天 → 免疫排程時間。
     _finmind_latest = None
     _skip_stocklist = False      # 行情晚到時只跳過 lup/stocklist,分點照跑
+    # ★同一次執行的產出要能被認出來。沒有這個,同一個資料夾裡的檔案
+    #   來自哪一輪就無從查證 —— 而「不同輪的檔案混在一起」正是 07-27 那天的病。
+    _RUN_ID = datetime.datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')
     if args.date:
         today = args.date
     elif token and args.syms_file and os.path.exists(args.syms_file):
@@ -604,6 +607,33 @@ def main():
                       ensure_ascii=False)
             print(f'  lup.json → data/{_qdate}/({len(lup_map)} 檔漲停價,'
                   f'上市 {len(quotes_twse)} + 上櫃 {len(quotes_tpex)} 行情)')
+            # ★★★2026-07-29 修【同一個資料夾內部不一致】的真正根因:
+            #   這條路會把漲停價【覆蓋】進過去某一天的資料夾,但不重算那天的名單。
+            #   實測 data/2026-07-27/:lup.json 最後寫於 07-28T16:17Z,
+            #   而 branch.json / stocklist.json 停在 07-28T03:48Z ——
+            #   於是漲停價是新的、名單是舊的,【用那個資料夾自己的檔算不出它自己的名單】。
+            #   客戶端因此每次啟動都報「雲端清單與本機重算不同」,而且指錯方向。
+            #   漲停價是 achip 套牢度的分母 → 換了分母就必須重算名單,否則就是自相矛盾。
+            #   → 覆蓋漲停價的同時,若那天已有 branch.json 就【一起把名單重算】。
+            try:
+                _bp = os.path.join(out_dir, 'branch.json')
+                if os.path.exists(_bp):
+                    _bf = json.load(open(_bp, encoding='utf-8'))
+                    _sl2 = sorted(achip_stocklist(_bf, lup_map, args.top_n))
+                    json.dump({'date': _qdate, 'codes': _sl2, 'top_n': args.top_n,
+                               'source': 'cloud_chip_pipeline',
+                               'formula': 'achip_a=z(nbr)+z(churn)+z(sutao)',
+                               'rebuilt_reason': '漲停價被較晚的行情覆蓋 → 同批重算,'
+                                                 '確保這個資料夾自洽',
+                               'run_id': _RUN_ID,
+                               'generated_at': datetime.datetime.now().isoformat(
+                                   timespec='seconds')},
+                              open(os.path.join(out_dir, 'stocklist.json'), 'w',
+                                   encoding='utf-8'), ensure_ascii=False, indent=1)
+                    print(f'  ★ 同步重算 data/{_qdate}/stocklist.json(漲停價換了,'
+                          f'名單必須跟著換)→ {_sl2}')
+            except Exception as _e_rb:
+                print(f'  ★ 重算 {_qdate} 名單失敗(該資料夾將維持不一致):{_e_rb}')
             try:
                 json.dump({'date': _qdate, 'quote_date': _qdate, 'run_date': today,
                            'source': 'endpoint Date field(直接判定,非推論)',
@@ -698,7 +728,7 @@ def main():
         try:
             json.dump({'formula': 'branch_v2=churn_r|top5_net_r|dt_buy_avg|nbr',
                        'impl': 'compute_branch_features',
-                       'date': today,
+                       'date': today, 'run_id': _RUN_ID,
                        'n_in': len(rows), 'n_out': len(feats),
                        'generated_at': datetime.datetime.now().isoformat(timespec='seconds')},
                       open(os.path.join(out_dir, 'branch_meta.json'), 'w', encoding='utf-8'),
@@ -718,10 +748,30 @@ def main():
         sl = sorted(achip_stocklist(feats, lup_map, args.top_n))
         json.dump({'date': today, 'codes': sl, 'top_n': args.top_n,
                    'source': 'cloud_chip_pipeline', 'formula': 'achip_a=z(nbr)+z(churn)+z(sutao)',
+                   'run_id': _RUN_ID,
                    'generated_at': datetime.datetime.now().isoformat(timespec='seconds')},
                   open(os.path.join(out_dir, 'stocklist.json'), 'w', encoding='utf-8'),
                   ensure_ascii=False, indent=1)
         print(f'  stocklist.json: top-{args.top_n} → {sl}')
+        # ★★自洽檢查:寫完之後,立刻用【剛落地的那三個檔】重算一次,必須算得出同一份。
+        #   為什麼要多此一舉 —— 07-27 那天的教訓正是「資料夾裡的檔案彼此對不起來」,
+        #   而且【沒有任何機制發現】,是客戶端每天報警才被注意到。
+        #   自己檢查自己,才不會把矛盾的資料交出去。
+        try:
+            _chk = sorted(achip_stocklist(
+                json.load(open(os.path.join(out_dir, 'branch.json'), encoding='utf-8')),
+                {str(k): float(v) for k, v in json.load(
+                    open(os.path.join(out_dir, 'lup.json'), encoding='utf-8')).items()},
+                args.top_n))
+            if _chk == sl:
+                print('  ✔ 自洽檢查:用剛寫出的 branch+lup 重算 = 同一份名單')
+            else:
+                print(f'  ★★ 自洽檢查失敗:這個資料夾算不出自己的名單!'
+                      f'重算={_chk} 存檔={sl}')
+                _append_attempt_log(args.out, 'INCONSISTENT(self-check failed)',
+                                    _finmind_latest, today)
+        except Exception as _e_sc:
+            print(f'  (自洽檢查跑不起來,不擋:{_e_sc})')
         _append_attempt_log(args.out, 'produced', _finmind_latest, today)
     else:
         print('  分點層跳過(無 token 或無 syms-file)— 官方層已完成,客戶端融資券/處置/漲停價可用')
