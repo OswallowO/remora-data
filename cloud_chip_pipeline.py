@@ -465,6 +465,7 @@ def main():
     # 根治日期:不用「執行當下 UTC 日期」(GitHub 排程延遲會跨午夜抓錯天),
     # 改問 FinMind「現在最新有分點的是哪天」就抓那天 → 免疫排程時間。
     _finmind_latest = None
+    _skip_stocklist = False      # 行情晚到時只跳過 lup/stocklist,分點照跑
     if args.date:
         today = args.date
     elif token and args.syms_file and os.path.exists(args.syms_file):
@@ -614,19 +615,35 @@ def main():
             except Exception:
                 pass
             _append_attempt_log(args.out,
-                                f'quote-late(endpoint={_qdate}, run={today}) → lup 已寫進 {_qdate}',
+                                f'quote-late(endpoint={_qdate}, run={today}) → lup 已寫進 {_qdate};分點照跑',
                                 _finmind_latest, today)
-            return
-        print(f'  ✔ 行情日期直接判定:端點自報 {_qdate} = 目標日期 → 產出')
-        try:
-            json.dump({'date': today, 'quote_date': _qdate,
-                       'source': 'endpoint Date field(直接判定,非推論)',
-                       'twse_date': _qd_tw, 'tpex_date': _qd_tp,
-                       'checked_at': datetime.datetime.now().isoformat(timespec='seconds')},
-                      open(os.path.join(out_dir, 'verified.json'), 'w', encoding='utf-8'),
-                      ensure_ascii=False, indent=1)
-        except Exception as _e_vf2:
-            print(f'  (verified.json 寫入失敗,不致命:{_e_vf2})')
+            # ★★2026-07-29 修:這裡原本直接 return —— 於是【免費的行情端點晚到,
+            #   就把整條產線停掉】,連「分點」那一層都不跑。
+            #   但分點抓的是 today 的資料(fetch_finmind_branch(..., today)),
+            #   跟這批舊行情無關;而且它是【最貴的一層】(FinMind 配額有限)。
+            #   2026-07-28 實際發生:紀錄顯示 finmind_latest=2026-07-28,
+            #   分點資料早就好了,卻因為行情端點晚到,三次排程全部在這裡返回 →
+            #   當天沒有 branch.json → 客戶端隔天分點特徵落後 →
+            #   而且新鮮度規則會讓「補 K 線」反而觸發暫停進場。
+            #   三次執行還全部回報「成功」= 又一次「成功但沒產出」。
+            #   → 改成:行情晚到只跳過需要漲停價的那部分(lup/stocklist),
+            #     分點照跑。out_dir 要換回今天,因為分點屬於今天。
+            _skip_stocklist = True
+            out_dir = os.path.join(args.out, today)
+            os.makedirs(out_dir, exist_ok=True)
+        else:
+            print(f'  ✔ 行情日期直接判定:端點自報 {_qdate} = 目標日期 → 產出')
+            # ⚠ verified.json 只能在【行情確實是今天】時寫 —— 它是「這天已就緒」的
+            #   判斷依據,寫錯會把那一天永久毒化(2026-07-27 的舊 commit 就修過這件事)。
+            try:
+                json.dump({'date': today, 'quote_date': _qdate,
+                           'source': 'endpoint Date field(直接判定,非推論)',
+                           'twse_date': _qd_tw, 'tpex_date': _qd_tp,
+                           'checked_at': datetime.datetime.now().isoformat(timespec='seconds')},
+                          open(os.path.join(out_dir, 'verified.json'), 'w', encoding='utf-8'),
+                          ensure_ascii=False, indent=1)
+            except Exception as _e_vf2:
+                print(f'  (verified.json 寫入失敗,不致命:{_e_vf2})')
     elif _thin:
         print('  行情日期對帳:沒有足夠的歷史收盤可比(第一次執行 / 樣本太少)→ 本次略過檢查')
     elif _match is None:
@@ -655,8 +672,11 @@ def main():
                       ensure_ascii=False, indent=1)
         except Exception as _e_vf:
             print(f'  (verified.json 寫入失敗,不致命:{_e_vf})')
-    json.dump(lup_map, open(os.path.join(out_dir, 'lup.json'), 'w', encoding='utf-8'), ensure_ascii=False)
-    print(f'  lup.json: {len(lup_map)} 檔漲停價(上市 {len(quotes_twse)} + 上櫃 {len(quotes_tpex)} 行情)')
+    if not _skip_stocklist:
+        json.dump(lup_map, open(os.path.join(out_dir, 'lup.json'), 'w', encoding='utf-8'), ensure_ascii=False)
+        print(f'  lup.json: {len(lup_map)} 檔漲停價(上市 {len(quotes_twse)} + 上櫃 {len(quotes_tpex)} 行情)')
+    else:
+        print('  (行情晚到:lup.json 已寫進它真正屬於的日期,今天這份不寫)')
 
     # 第二層:分點(token 已於頂部讀取)
     if token and args.syms_file and os.path.exists(args.syms_file):
@@ -690,6 +710,11 @@ def main():
         # 第三層:自動 stocklist(achip top-N;字母序 = 客戶端引擎 day_stocks 順序)
         # 此清單供「下一個交易日」使用;客戶端 _resolve_daily_stocklist 會往回
         # 找最近一份(≤12 天)並驗新鮮度
+        if _skip_stocklist:
+            print('  (行情晚到:今天的漲停價不可信 → 只產出 branch.json,'
+                  'stocklist 等下次行情到齊再產)')
+            _append_attempt_log(args.out, 'branch-only(quote-late)', _finmind_latest, today)
+            return
         sl = sorted(achip_stocklist(feats, lup_map, args.top_n))
         json.dump({'date': today, 'codes': sl, 'top_n': args.top_n,
                    'source': 'cloud_chip_pipeline', 'formula': 'achip_a=z(nbr)+z(churn)+z(sutao)',
