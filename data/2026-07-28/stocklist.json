@@ -16,6 +16,6 @@
  "source": "cloud_chip_pipeline",
  "formula": "achip_a=z(nbr)+z(churn)+z(sutao)",
  "rebuilt_reason": "漲停價被較晚的行情覆蓋 → 同批重算,確保這個資料夾自洽",
- "run_id": "20260729T155958Z",
- "generated_at": "2026-07-29T16:00:31"
+ "run_id": "20260729T162514Z",
+ "generated_at": "2026-07-29T16:25:25"
 }
