@@ -308,6 +308,57 @@ def compute_lup_map(twse_rows, tpex_rows):
     return {k: v for k, v in lup.items() if k and v > 0}
 
 
+def fetch_finmind_prices(token, syms, date_str, budget=None):
+    """★★2026-07-30 新增:用 FinMind 取「當日收盤 + 漲跌」→ 前收 = close − spread。
+
+    為什麼要這一支(07-29 / 07-30 連續兩天的事故根因)
+      漲停價的唯一來源是 TWSE / TPEx 的 OpenAPI 當日行情端點,而 TWSE 那個端點
+      【不可靠】:實測 2026-07-30 台北 20:44,它自報的日期還停在 07-29
+      (BWIBBU_ALL / MI_INDEX20 也一樣落後),而 FinMind 同一刻已經有 07-30。
+      連續兩天因此 quote-late → 沒有 stocklist → chip 路徑整天缺席
+      (07-28 那天是我手動補跑才救回來的,所以看起來只壞一天)。
+
+    公式與 TWSE 完全相同(前收 = 收盤 − 漲跌),所以不是換一種算法,
+    只是換一個【比較早拿得到同一個數字】的來源:
+      TWSE  ClosingPrice / Change
+      FinMind close      / spread
+    ⚠ 為什麼不直接用「前一交易日的收盤」:遇除權息那天,參考價不等於前一日收盤。
+      Close − Change 會自動吃到交易所調整後的參考價,這是它比較可靠的原因。
+
+    成本:FinMind 全市場單日查詢會回 400(實測)→ 只能逐檔。
+    所以這支【只在行情端點落後時才被呼叫】,正常日零額外配額消耗。
+    回 {sym: prev_close}。
+    """
+    out = {}
+    n_ok = n_bad = 0
+    for i, s in enumerate(syms):
+        if budget is not None and i >= budget:
+            print(f'  (FinMind 前收:到達自訂上限 {budget} 檔,其餘不查)')
+            break
+        try:
+            q = urllib.parse.urlencode({'dataset': 'TaiwanStockPrice', 'data_id': s,
+                                        'start_date': date_str, 'end_date': date_str,
+                                        'token': token})
+            j = _get_json('https://api.finmindtrade.com/api/v4/data?' + q)
+            rows = (j or {}).get('data') or []
+            if not rows:
+                n_bad += 1
+                continue
+            r = rows[-1]
+            if str(r.get('date', ''))[:10] != date_str:
+                n_bad += 1
+                continue
+            c, sp = _num(r.get('close')), _num(r.get('spread'))
+            if c and c > 0:
+                out[str(s)] = round(c - (sp or 0.0), 4)
+                n_ok += 1
+        except Exception:
+            n_bad += 1
+        time.sleep(0.05)          # 禮貌限速(比分點那層寬,因為只在後備路徑跑)
+    print(f'  FinMind 前收:{n_ok} 檔取得 / {n_bad} 檔無資料(目標日 {date_str})')
+    return out
+
+
 def fetch_finmind_branch(token, syms, date_str):
     """③ 分點買賣日報(FinMind);回 {sym: rows}。
     產品化注意:全市場逐檔抓量大,僅抓族群清單股(~450 檔);
@@ -599,6 +650,46 @@ def main():
     #   有 Date 就用 Date 判定;讀不到 Date 才退回舊的 match_quote_day。
     #   (舊那套是在「以為端點沒有日期」的錯誤前提下做的 —— 留著當備援,
     #    因為端點欄位哪天又改了,至少還有一條路。)
+    # ★★2026-07-30:行情端點落後時,先給 FinMind 一次機會,不要直接放棄清單。
+    #   07-29 / 07-30 連續兩天:FinMind 分點【早就好了】(紀錄的 finmind_latest 就是目標日),
+    #   卡住的只有 TWSE 的當日行情端點 → 於是最貴的一層跑完了,
+    #   卻因為拿不到漲停價而不產出 stocklist,chip 路徑整天缺席。
+    #   FinMind 的 close/spread 與 TWSE 的 ClosingPrice/Change 是【同一個數字】,
+    #   所以這不是換算法,是換一個比較早拿得到的來源。
+    #   只在落後時跑 → 正常日零額外配額。
+    _lup_src = 'twse/tpex'
+    if _qdate and not _date_ok and token and args.syms_file and os.path.exists(args.syms_file):
+        try:
+            _fm_syms = [l.strip() for l in open(args.syms_file, encoding='utf-8') if l.strip()]
+            print(f'  行情端點落後({_qdate} < {today})→ 改問 FinMind 取 {len(_fm_syms)} 檔前收…')
+            # 上限:workflow 用的 group_syms.txt 是 231 檔,配額 6000/hr → 綽綽有餘。
+            # 但如果哪天換成 fullmarket(2508 檔),分點層本身就吃 2508 次,
+            # 再加一倍會逼近配額 → 給一個安全上限,超過就不跑(寧可沒清單也不要把配額燒光,
+            # 因為分點是更貴、更不可替代的那一層)。
+            _fm_prev = fetch_finmind_prices(token, _fm_syms, today, budget=600)
+            # 覆蓋率不足就不要用 —— 半套的漲停價比沒有更危險(它會靜默改變選股)
+            _cov = len(_fm_prev) / max(1, len(_fm_syms))
+            if _cov >= 0.80:
+                _lup_fm = {}
+                for _s, _pc in _fm_prev.items():
+                    try:
+                        _v = _floor_tick(_pc * 1.10)   # ★底線版才是本檔的函式名
+                        if _v and _v > 0:
+                            _lup_fm[_s] = _v
+                    except Exception:
+                        pass
+                if _lup_fm:
+                    lup_map = _lup_fm
+                    _date_ok = True
+                    _lup_src = 'finmind(TaiwanStockPrice close-spread)'
+                    print(f'  ✔ 改用 FinMind 前收算出 {len(_lup_fm)} 檔漲停價'
+                          f'(覆蓋 {_cov*100:.0f}%)→ 照常產出 stocklist')
+            else:
+                print(f'  ★ FinMind 前收覆蓋率只有 {_cov*100:.0f}%(<80%)→ 不採用,'
+                      f'維持「不產出清單」(半套漲停價會靜默改變選股)')
+        except Exception as _e_fm:
+            print(f'  ★ FinMind 前收後備失敗(維持原行為):{_e_fm}')
+
     if _qdate:
         if not _date_ok:
             # 漲停價寫進真正的日期(上面已把 out_dir 換過去),然後結束 ——
@@ -619,8 +710,11 @@ def main():
                 _bp = os.path.join(out_dir, 'branch.json')
                 if os.path.exists(_bp):
                     _bf = json.load(open(_bp, encoding='utf-8'))
-                    _sl2 = sorted(achip_stocklist(_bf, lup_map, args.top_n))
+                    # ★同上:保留 achip 名次序,不要 sorted() 掉
+                    _sl2 = achip_stocklist(_bf, lup_map, args.top_n)
                     json.dump({'date': _qdate, 'codes': _sl2, 'top_n': args.top_n,
+                               'order': 'achip_rank_desc',
+                               'rank': {s: i + 1 for i, s in enumerate(_sl2)},
                                'source': 'cloud_chip_pipeline',
                                'formula': 'achip_a=z(nbr)+z(churn)+z(sutao)',
                                'rebuilt_reason': '漲停價被較晚的行情覆蓋 → 同批重算,'
@@ -669,6 +763,11 @@ def main():
                 json.dump({'date': today, 'quote_date': _qdate,
                            'source': 'endpoint Date field(直接判定,非推論)',
                            'twse_date': _qd_tw, 'tpex_date': _qd_tp,
+                           # ★2026-07-30:漲停價來源要落地。它是 achip 的分母,
+                           #   而現在有兩條可能的來源(TWSE 行情 / FinMind 前收)——
+                           #   事後稽核選股時,必須看得出這一天用的是哪一條。
+                           'lup_source': _lup_src,
+                           'lup_n': len(lup_map),
                            'checked_at': datetime.datetime.now().isoformat(timespec='seconds')},
                           open(os.path.join(out_dir, 'verified.json'), 'w', encoding='utf-8'),
                           ensure_ascii=False, indent=1)
@@ -745,8 +844,18 @@ def main():
                   'stocklist 等下次行情到齊再產)')
             _append_attempt_log(args.out, 'branch-only(quote-late)', _finmind_latest, today)
             return
-        sl = sorted(achip_stocklist(feats, lup_map, args.top_n))
+        # ★★2026-07-30:這裡原本包了一層 sorted() —— 而 achip_stocklist 回傳的
+        #   【已經是按 achip 分數由高到低】的名次序。外面再 sorted() 就把名次洗成股號序,
+        #   而客戶端(live scan_order)與回測(day_stocks)【都是照這個檔案的順序讀】
+        #   → 等於「雲端算了 top-10 的名次,卻在寫檔那一刻丟掉」,
+        #     live 變成用股號大小決定 chip 誰先進場。
+        #   舊註解寫「字母序 = 客戶端引擎 day_stocks 順序」—— 那是把「客戶端照順序讀」
+        #   誤解成「客戶端需要字母序」。客戶端要的是【我們給的順序】,不是字母序。
+        #   → 保留名次序,並額外寫 rank 欄(明示,不用靠陣列位置意會)。
+        sl = achip_stocklist(feats, lup_map, args.top_n)
         json.dump({'date': today, 'codes': sl, 'top_n': args.top_n,
+                   'order': 'achip_rank_desc',
+                   'rank': {s: i + 1 for i, s in enumerate(sl)},
                    'source': 'cloud_chip_pipeline', 'formula': 'achip_a=z(nbr)+z(churn)+z(sutao)',
                    'run_id': _RUN_ID,
                    'generated_at': datetime.datetime.now().isoformat(timespec='seconds')},
@@ -758,11 +867,12 @@ def main():
         #   而且【沒有任何機制發現】,是客戶端每天報警才被注意到。
         #   自己檢查自己,才不會把矛盾的資料交出去。
         try:
-            _chk = sorted(achip_stocklist(
+            # ★自洽檢查也要用同一種順序,否則名次序 vs 字母序會【自己跟自己對不上】
+            _chk = achip_stocklist(
                 json.load(open(os.path.join(out_dir, 'branch.json'), encoding='utf-8')),
                 {str(k): float(v) for k, v in json.load(
                     open(os.path.join(out_dir, 'lup.json'), encoding='utf-8')).items()},
-                args.top_n))
+                args.top_n)
             if _chk == sl:
                 print('  ✔ 自洽檢查:用剛寫出的 branch+lup 重算 = 同一份名單')
             else:
