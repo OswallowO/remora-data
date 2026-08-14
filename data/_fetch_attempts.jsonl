@@ -195,3 +195,4 @@
 {"utc": "2026-08-14 03:20:17", "taipei": "2026-08-14 11:20:17", "finmind_latest": null, "target": "2026-08-14", "status": "quote-late(endpoint=2026-08-13, run=2026-08-14) → lup 已寫進 2026-08-13;分點照跑"}
 {"utc": "2026-08-14 03:22:28", "taipei": "2026-08-14 11:22:28", "finmind_latest": null, "target": "2026-08-14", "status": "wait-not-published"}
 {"utc": "2026-08-14 15:19:36", "taipei": "2026-08-14 23:19:36", "finmind_latest": null, "target": "2026-08-14", "status": "wait-not-published"}
+{"utc": "2026-08-14 16:01:09", "taipei": "2026-08-15 00:01:09", "finmind_latest": null, "target": "2026-08-14", "status": "wait-not-published"}
