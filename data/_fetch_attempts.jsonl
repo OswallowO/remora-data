@@ -224,3 +224,5 @@
 {"utc": "2026-08-19 16:26:28", "taipei": "2026-08-20 00:26:28", "finmind_latest": null, "target": "2026-08-19", "status": "wait-not-published"}
 {"utc": "2026-08-20 02:11:07", "taipei": "2026-08-20 10:11:07", "finmind_latest": null, "target": "2026-08-20", "status": "quote-late(endpoint=2026-08-19, run=2026-08-20) → lup 已寫進 2026-08-19;分點照跑"}
 {"utc": "2026-08-20 02:13:01", "taipei": "2026-08-20 10:13:01", "finmind_latest": null, "target": "2026-08-20", "status": "wait-not-published"}
+{"utc": "2026-08-20 15:05:03", "taipei": "2026-08-20 23:05:03", "finmind_latest": null, "target": "2026-08-20", "status": "quote-late(endpoint=2026-08-19, run=2026-08-20) → lup 已寫進 2026-08-19;分點照跑"}
+{"utc": "2026-08-20 15:07:06", "taipei": "2026-08-20 23:07:06", "finmind_latest": null, "target": "2026-08-20", "status": "wait-not-published"}
