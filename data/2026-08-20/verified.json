@@ -4,7 +4,7 @@
  "run_date": "2026-08-21",
  "source": "endpoint Date field(直接判定,非推論)",
  "twse_date": "2026-08-20",
- "tpex_date": "2026-08-20",
+ "tpex_date": "2026-08-21",
  "note": "行情晚到:寫進它真正屬於的日期;stocklist 未產出",
- "checked_at": "2026-08-21T02:17:29"
+ "checked_at": "2026-08-21T15:03:33"
 }
