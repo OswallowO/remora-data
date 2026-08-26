@@ -1,0 +1,10 @@
+{
+ "date": "2026-08-25",
+ "quote_date": "2026-08-25",
+ "run_date": "2026-08-26",
+ "source": "endpoint Date field(直接判定,非推論)",
+ "twse_date": "2026-08-25",
+ "tpex_date": "2026-08-25",
+ "note": "行情晚到:寫進它真正屬於的日期;stocklist 未產出",
+ "checked_at": "2026-08-26T02:06:34"
+}
