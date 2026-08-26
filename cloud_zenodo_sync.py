@@ -26,7 +26,7 @@ except Exception: pass
 
 Z1_CONCEPT = '20800839'    # 散資料
 Z2_CONCEPT = '20800285'    # 分點(月包 + 特徵)
-PACK_HDR = '#schema branch/1 cols=date,stock,trader,buy,sell,buy_vwap\n'
+PACK_HDR = '#schema branch/2 cols=date,stock,trader,buy,sell,buy_vwap,sell_vwap\n'
 PACK_NAME = lambda ym: f'分點月包_{ym}.jsonl.gz'
 FEAT_NAME = '分點籌碼_全市場特徵v2.json.gz'   # ★須與 Zenodo 現有檔名逐字相同,否則會多傳一個新檔而非更新
 SAN_NAME = '散資料_漲停價處置股.json.gz'
@@ -63,20 +63,29 @@ def _fetch_branch_paced(token, syms, date_str):
 
 # ═══════════════ 分點:抓 + 聚合成月包列 ═══════════════
 def branch_pack_and_feats(token, syms, date_str):
-    """回 (pack_lines[list], feats{sym:featdict})。pack line = [date,stock,trader,buy,sell,buy_vwap]。"""
+    """回 (pack_lines[list], feats{sym:featdict})。pack line = [date,stock,trader,buy,sell,buy_vwap,sell_vwap]。"""
     raw = _fetch_branch_paced(token, syms, date_str)        # {sym: [FinMind raw rows]}(自帶限速)
     feats = ccp.compute_branch_features(raw)                 # 特徵(公式對齊研究產生器)
+    # ★★2026-08-20 修資訊遺失(重大)：原本只累加 `b * p`(買方金額)，
+    #   **`se * p`(賣方金額)從來沒有累加** → 月包只有 buy_vwap，
+    #   「這個分點賣在哪些價位」的資訊在聚合這一步被永久丟棄。
+    #   但 FinMind 原始列本來就是【逐價位】的（{trader, price, buy, sell}），
+    #   賣出均價一直都算得出來，只是沒人算。
+    #   後果：無法回答「隔日沖在哪個價位倒貨」→ 曾被誤判成「資料上做不到」。
+    #   → 補上 sell_vwap。schema 往後相容（舊讀取端取前 6 欄不受影響）。
     lines = []
     for sym, rows in raw.items():
-        agg = {}   # tid -> [buy, sell, Σbuy*price]
+        agg = {}   # tid -> [buy, sell, Σbuy*price, Σsell*price]
         for r in rows:
             tid = str(r.get('securities_trader_id', '') or '').strip()
             if not tid: continue
             b = int(r.get('buy', 0) or 0); se = int(r.get('sell', 0) or 0); p = float(r.get('price', 0) or 0)
-            a = agg.setdefault(tid, [0, 0, 0.0]); a[0] += b; a[1] += se; a[2] += b * p
-        for tid, (b, se, sbp) in agg.items():
+            a = agg.setdefault(tid, [0, 0, 0.0, 0.0])
+            a[0] += b; a[1] += se; a[2] += b * p; a[3] += se * p
+        for tid, (b, se, sbp, ssp) in agg.items():
             bv = round(sbp / b, 4) if b else None
-            lines.append([date_str, str(sym), tid, b, se, bv])
+            sv = round(ssp / se, 4) if se else None      # ★新增：賣出均價
+            lines.append([date_str, str(sym), tid, b, se, bv, sv])
     return lines, feats
 
 
