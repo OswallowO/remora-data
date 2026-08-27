@@ -28,6 +28,6 @@
  },
  "source": "cloud_chip_pipeline",
  "formula": "achip_a=z(nbr)+z(churn)+z(sutao)",
- "run_id": "20260827T100129Z",
- "generated_at": "2026-08-27T10:10:05"
+ "run_id": "20260827T104154Z",
+ "generated_at": "2026-08-27T10:48:21"
 }
