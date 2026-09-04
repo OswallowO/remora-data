@@ -3,8 +3,8 @@
  "quote_date": "2026-09-03",
  "source": "endpoint Date field(直接判定,非推論)",
  "twse_date": "2026-09-03",
- "tpex_date": "2026-09-04",
+ "tpex_date": null,
  "lup_source": "finmind(TaiwanStockPrice close-spread)",
  "lup_n": 226,
- "checked_at": "2026-09-04T18:15:16"
+ "checked_at": "2026-09-04T18:46:44"
 }
