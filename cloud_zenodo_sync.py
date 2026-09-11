@@ -351,7 +351,17 @@ def main():
                 f'https://zenodo.org/api/records/{Z2_CONCEPT}/versions/latest', timeout=60))
             fu = next((f['links']['self'] for f in rec.get('files', []) if f['key'] == FEAT_NAME), None)
             if fu:
-                cur = json.loads(gzip.decompress(_zget(fu, ztok or '', binary=True)))
+                # ★★2026-09-11：這裡原本用 _zget()，而 _zget 吃的是模組層的
+                #   UA = {'User-Agent': 'Mozilla/5.0', ...}。本模組自己的註解就寫過：
+                #   「Zenodo records API 會擋 Mozilla/5.0（Cloudflare bot 防護）回 403」，
+                #   _dl_record_file 也已經照改了 —— 唯獨這個呼叫點漏掉。
+                #   實測（同一個檔）：
+                #     Mozilla/5.0 + token → 403；Mozilla/5.0 不帶 token → 403；
+                #     python-urllib/3 + token → ✔ 2,540,557 bytes。所以是 UA，不是 token。
+                #   後果：跳過檢查【永遠】丟 403 → 從來沒跳過過 →
+                #   一晚 cron 觸發 5 次，每次都重抓 2,508 檔 + 重傳一個多餘版本
+                #   （實測單次 54 分鐘 / 2.6 GB）。
+                cur = json.loads(gzip.decompress(_dl_record_file(fu) or b''))
                 if any(k.endswith('|' + d) for k in cur):
                     log(f"✅ {d} 已在 Zenodo(特徵 json 已含)→ 本次跳過(每日 cron 去重)"); return
         except Exception as e:
