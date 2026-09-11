@@ -681,6 +681,17 @@ def main():
                 if _lup_fm:
                     lup_map = _lup_fm
                     _date_ok = True
+                    # ★★2026-09-11：這一行把 _date_ok 設回 True，意思就是
+                    #   「漲停價已經是 today 的了」——因為 _lup_fm 是拿
+                    #   fetch_finmind_prices(..., today) 的前收算出來的。
+                    #   但 out_dir 還停在 data/<_qdate>（上面因為行情晚到改指過去），
+                    #   於是 lup.json 會被寫進【別天】的資料夾。
+                    #   實測：branch/stocklist 錐定到 today 之後，lup 留在 _qdate，
+                    #   同一包被拆成兩個資料夾 → 自洽檢查直接跑不起來
+                    #   （「資料夾算不出自己的名單」正是 07-27 事故的形狀）。
+                    #   → 後備成功 = 日期已對齊，把 out_dir 一併錐回 today。
+                    out_dir = os.path.join(args.out, today)
+                    os.makedirs(out_dir, exist_ok=True)
                     _lup_src = 'finmind(TaiwanStockPrice close-spread)'
                     print(f'  ✔ 改用 FinMind 前收算出 {len(_lup_fm)} 檔漲停價'
                           f'(覆蓋 {_cov*100:.0f}%)→ 照常產出 stocklist')
@@ -817,6 +828,19 @@ def main():
             print(f'  WAIT 分點尚未公佈或無資料({today})→ 本次不產出 branch/stocklist,等下次排程重試')
             _append_attempt_log(args.out, 'wait-not-published', _finmind_latest, today)
             return
+        # ★★2026-09-11:out_dir 在「行情端點晚一天」時會被改指到 data/<行情日>,
+        #   那對 lup.json 是對的(漲停價確實屬於那一天),但【對分點是錯的】——
+        #   上面這一行抓的是 fetch_finmind_branch(..., today),資料屬於 today。
+        #   實測後果:遠端每一天的 branch_meta.date 都比資料夾名多一個交易日
+        #   (data/2026-09-04 裝 2026-09-07 的資料),客戶端依「資料夾名=特徵日」
+        #   去 data/<最近交易日> 找就永遠找不到 → 2026-09-11 chip 整天缺席。
+        #   → 這三個檔依定義屬於 today,寫之前重新錨定,不依賴上面的分支有沒有改回來。
+        _chip_dir = os.path.join(args.out, today)
+        os.makedirs(_chip_dir, exist_ok=True)
+        if os.path.abspath(_chip_dir) != os.path.abspath(out_dir):
+            print(f'  ★ 分點產物重新錨定:out_dir={out_dir} → {_chip_dir}'
+                  f'(branch 抓的是 {today} 的資料)')
+        out_dir = _chip_dir
         json.dump(feats, open(os.path.join(out_dir, 'branch.json'), 'w', encoding='utf-8'), ensure_ascii=False)
         # ★R12-1(2026-07-27):branch.json 是【公式的產物】,卻沒有任何版本/公式標記。
         #   stocklist.json 有 formula 欄位 —— 當初能抓到「雲端跑的是 2z(nbr) 不是定版 A 式」
@@ -882,6 +906,30 @@ def main():
                                     _finmind_latest, today)
         except Exception as _e_sc:
             print(f'  (自洽檢查跑不起來,不擋:{_e_sc})')
+        # ★★2026-09-11:這次連續多天沒人發現,是因為每一步都 success、
+        #   attempt log 也寫 'produced' —— 「成功但沒產出」看起來跟正常一模一樣。
+        #   收尾必須自己驗一次,不合約定就【讓 job 變紅】,不要安靜地過。
+        _bad = []
+        _fin = os.path.join(args.out, today)
+        for _need in ('branch.json', 'branch_meta.json', 'stocklist.json'):
+            if not os.path.exists(os.path.join(_fin, _need)):
+                _bad.append(f'data/{today}/{_need} 不存在')
+        try:
+            _m = json.load(open(os.path.join(_fin, 'branch_meta.json'), encoding='utf-8'))
+            if str(_m.get('date')) != str(today):
+                _bad.append(f'data/{today}/branch_meta.json 自報 date={_m.get("date")}'
+                            f',與資料夾名不符')
+        except Exception as _e_v:
+            _bad.append(f'branch_meta.json 讀不起來:{_e_v}')
+        if _bad:
+            print('  ★★ 收尾檢查不通過 —— 這一天【沒有】產出客戶端拿得到的資料:')
+            for _b in _bad:
+                print(f'     - {_b}')
+            print('     客戶端的約定是「資料夾名 = 特徵日」,不符就整包不收。')
+            _append_attempt_log(args.out, 'FAILED(final-check: %s)' % ' ; '.join(_bad),
+                                _finmind_latest, today)
+            sys.exit(1)
+        print(f'  ✔ 收尾檢查:data/{today}/ 的 branch+meta+stocklist 齊全且日期相符')
         _append_attempt_log(args.out, 'produced', _finmind_latest, today)
     else:
         print('  分點層跳過(無 token 或無 syms-file)— 官方層已完成,客戶端融資券/處置/漲停價可用')
