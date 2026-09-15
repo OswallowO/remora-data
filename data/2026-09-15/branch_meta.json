@@ -1,0 +1,9 @@
+{
+ "formula": "branch_v2=churn_r|top5_net_r|dt_buy_avg|nbr",
+ "impl": "compute_branch_features",
+ "date": "2026-09-15",
+ "run_id": "20260915T181956Z",
+ "n_in": 227,
+ "n_out": 227,
+ "generated_at": "2026-09-15T18:25:03"
+}
