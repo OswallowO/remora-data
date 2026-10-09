@@ -1,10 +1,10 @@
 {
  "date": "2026-10-08",
- "quote_date": "2026-10-07",
+ "quote_date": "2026-10-08",
+ "run_date": "2026-10-09",
  "source": "endpoint Date field(直接判定,非推論)",
- "twse_date": "2026-10-07",
+ "twse_date": "2026-10-08",
  "tpex_date": "2026-10-08",
- "lup_source": "finmind(TaiwanStockPrice close-spread)",
- "lup_n": 226,
- "checked_at": "2026-10-08T20:38:41"
+ "note": "行情晚到:寫進它真正屬於的日期;stocklist 未產出",
+ "checked_at": "2026-10-09T06:24:12"
 }
