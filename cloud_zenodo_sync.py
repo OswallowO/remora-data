@@ -16,7 +16,9 @@ Zenodo 資料集(concept id):
   python cloud_zenodo_sync.py --start 2026-07-01 --end 2026-07-11 --go     # 補齊
   python cloud_zenodo_sync.py --latest --go                                # 每日:自動抓 FinMind 最新分點日
 需要 env:FINMIND_TOKEN、ZENODO_TOKEN。Py3.10+。"""
-import argparse, datetime, gzip, io, json, os, sys, time, urllib.parse, urllib.request
+import argparse, datetime, gzip, hashlib, io, json, os, sys, time, urllib.parse, urllib.request
+
+import requests
 
 HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE)
 import cloud_chip_pipeline as ccp   # 複用官方/FinMind 抓取器 + 特徵/漲停公式(其 import 已把 stdout 轉 utf-8)
@@ -24,12 +26,14 @@ import cloud_chip_pipeline as ccp   # 複用官方/FinMind 抓取器 + 特徵/�
 try: sys.stdout.reconfigure(encoding='utf-8')   # 冪等:若尚未 utf-8 就地調整(不新建物件)
 except Exception: pass
 
-Z1_CONCEPT = '20800839'    # 散資料
-Z2_CONCEPT = '20800285'    # 分點(月包 + 特徵)
-PACK_HDR = '#schema branch/2 cols=date,stock,trader,buy,sell,buy_vwap,sell_vwap\n'
+Z1_CONCEPT = '20800838'    # 散資料(20800839 是 v1 的版本 id)
+Z2_CONCEPT = '20800284'    # 分點(月包 + 特徵)(20800285 是 v1 的版本 id)
+# ★2026-10-15:格式統一為 Zenodo 上 32/33 個月包所用的 branch/1(6 欄);branch/2 只出現在 2026-09
+PACK_HDR = '#schema branch/1 cols=date,stock,trader,buy,sell,buy_vwap\n'
 PACK_NAME = lambda ym: f'分點月包_{ym}.jsonl.gz'
 FEAT_NAME = '分點籌碼_全市場特徵v2.json.gz'   # ★須與 Zenodo 現有檔名逐字相同,否則會多傳一個新檔而非更新
 SAN_NAME = '散資料_漲停價處置股.json.gz'
+MIN_DAY_STOCKS = 1700   # 一天至少多少檔有分點才算完整(全市場正常 ~2,100~2,300)
 UA = {'User-Agent': 'Mozilla/5.0', 'accept': 'application/json'}
 
 
@@ -84,8 +88,8 @@ def branch_pack_and_feats(token, syms, date_str):
             a[0] += b; a[1] += se; a[2] += b * p; a[3] += se * p
         for tid, (b, se, sbp, ssp) in agg.items():
             bv = round(sbp / b, 4) if b else None
-            sv = round(ssp / se, 4) if se else None      # ★新增：賣出均價
-            lines.append([date_str, str(sym), tid, b, se, bv, sv])
+            # 賣出均價(sell_vwap)不寫入:月包格式統一為 branch/1 六欄
+            lines.append([date_str, str(sym), tid, b, se, bv])   # branch/1:6 欄,與 Zenodo 既有月包一致
     return lines, feats
 
 
@@ -177,11 +181,29 @@ def dispo_on_date(punish_rows, date_str):
 
 
 # ═══════════════ Zenodo:新版本 → merge 檔 → 發佈 ═══════════════
+_ZS = {}
+
+
+def _zsession(token):
+    u"""帶 Authorization 標頭的 Session。
+
+    憑證不可以放網址查詢字串:2026-09-21 上傳中途 SSL 斷線,requests 把整個 URL
+    印進例外訊息,access_token 就這樣進了日誌與對話紀錄。放標頭的話,
+    任何例外、log、proxy 紀錄都印不到它。
+    """
+    s = _ZS.get(token)
+    if s is None:
+        s = requests.Session()
+        s.headers['User-Agent'] = 'remora-uploader/1.0'   # Zenodo 會擋 Mozilla/5.0
+        s.headers['Authorization'] = 'Bearer %s' % token
+        _ZS[token] = s
+    return s
+
+
 def _zget(url, token, binary=False, timeout=120):
-    sep = '&' if '?' in url else '?'
-    req = urllib.request.Request(f'{url}{sep}access_token={token}', headers=UA)
-    r = urllib.request.urlopen(req, timeout=timeout).read()
-    return r if binary else json.loads(r)
+    r = _zsession(token).get(url, timeout=timeout)
+    r.raise_for_status()
+    return r.content if binary else r.json()
 
 
 def _dl_record_file(url, timeout=180):
@@ -206,62 +228,58 @@ def published_file_bytes(concept, name, token, version_id=None):
     """從『最新已發佈版本』(或指定 version_id)下載指定檔內容。回 bytes 或 None(檔不存在=視為新檔)。
     ★records API(metadata + 檔案內容)都是『公開』端點——**一律不帶 access_token**;帶了(deposit-scoped
     token)會被 records API 擋成 403(canary#4 的特徵截斷根因)。"""
-    try:
-        _url = (f'https://zenodo.org/api/records/{version_id}' if version_id
-                else f'https://zenodo.org/api/records/{concept}/versions/latest')
-        rec = json.loads(_dl_record_file(_url) or b'{}')   # 無 token 取 metadata
-        for f in rec.get('files', []):
-            if f.get('key') == name:
-                _u = (f.get('links') or {}).get('self') or (f.get('links') or {}).get('download')
-                if _u:
-                    _b = _dl_record_file(_u)
-                    if _b is None:
-                        log(f"  ⚠️ 取現有 {name} 下載回空(視為新檔,可能截斷歷史,請留意)")
-                    return _b
-    except Exception as e:
-        log(f"  (取現有 {name} 失敗,視為新檔續傳):{e}")
+    # ★2026-10-15:原本「下載失敗」與「檔案不存在」都回 None,呼叫端把失敗當成新檔
+    #   → merge 後只剩這次的資料 → 發佈 = 一次網路抖動就把整個月/整份歷史截斷。
+    #   現在只有「這一版真的沒有這個檔」才回 None;其餘一律 raise,整次不發佈。
+    _url = f'https://zenodo.org/api/records/{version_id or concept}'
+    _meta = _dl_record_file(_url)
+    if not _meta:
+        raise RuntimeError(f'取 Zenodo 版本資訊失敗({concept})→ 不發佈')
+    rec = json.loads(_meta)
+    for f in rec.get('files', []):
+        if f.get('key') == name:
+            _u = (f.get('links') or {}).get('self') or (f.get('links') or {}).get('download')
+            _b = _dl_record_file(_u, timeout=900) if _u else None
+            if not _b:
+                raise RuntimeError(f'下載現有 {name} 失敗 → 不發佈(避免截斷歷史)')
+            _want = str(f.get('checksum', '')).split(':')[-1]
+            if _want and hashlib.md5(_b).hexdigest() != _want:
+                raise RuntimeError(f'下載的 {name} MD5 不符 → 不發佈')
+            return _b
     return None
 
 
 def _discard_leftover_drafts(real_concept, token):
-    """丟棄該 concept 所有『未發佈草稿』(前次失敗留下的殘骸)。回丟棄數。
-    ★安全:每次執行都從『最新已發佈版』重建,草稿殘骸無保留價值;不清會① newversion 撞 400
-    ② 誤用到殘缺草稿(檔案不全)→ 發佈會丟資料。"""
-    import requests
-    p = {'access_token': token}; _n = 0
-    try:
-        deps = requests.get('https://zenodo.org/api/deposit/depositions',
-                            params={**p, 'size': 100, 'sort': '-mostrecent', 'all_versions': 'true'}).json()
-        if isinstance(deps, dict):   # 分頁/錯誤包裝 → 取 hits
-            deps = (deps.get('hits', {}) or {}).get('hits', []) if 'hits' in deps else []
-        if not isinstance(deps, list):
-            deps = []
-        for d in deps:
-            if not isinstance(d, dict):
-                continue
-            if (str(d.get('conceptrecid')) == str(real_concept)
-                    and not d.get('submitted') and d.get('state') == 'unsubmitted'):
-                try:
-                    requests.delete(f"https://zenodo.org/api/deposit/depositions/{d['id']}", params=p)
-                    log(f"  丟棄殘留草稿 {d['id']}(檔 {len(d.get('files', []))})"); _n += 1
-                except Exception as _e:
-                    log(f"  (草稿 {d['id']} 刪除失敗:{_e})")
-    except Exception as e:
-        log(f"  (清草稿略過:{e})")
+    """丟棄該 concept 兩小時以上沒動的『未發佈草稿』(前次失敗的殘骸)。回丟棄數。
+    ★2026-10-15:年輕的草稿可能是別的上傳程序(回補)正在用 → 不丟、本次不發佈(raise)。"""
+    S = _zsession(token); _n = 0
+    deps = S.get('https://zenodo.org/api/deposit/depositions',
+                 params={'size': 100, 'sort': 'mostrecent', 'all_versions': 'true'}, timeout=60).json()
+    for d in (deps if isinstance(deps, list) else []):
+        if not isinstance(d, dict) or str(d.get('conceptrecid')) != str(real_concept) or d.get('submitted'):
+            continue
+        try:
+            _age = time.time() - datetime.datetime.strptime(str(d.get('modified'))[:19], '%Y-%m-%dT%H:%M:%S')                 .replace(tzinfo=datetime.timezone.utc).timestamp()
+        except Exception:
+            _age = 0
+        if _age < 7200:
+            raise RuntimeError('有其他程序的草稿正在進行(%s)→ 本次不發佈,下一輪再試' % d.get('id'))
+        S.post('https://zenodo.org/api/deposit/depositions/%s/actions/discard' % d['id'], timeout=60)
+        S.delete('https://zenodo.org/api/deposit/depositions/%s' % d['id'], timeout=60)
+        log(f"  丟棄殘留草稿 {d['id']}"); _n += 1
     return _n
 
 
 def zenodo_new_draft(concept, token):
     """回 (dep_id, bucket, files[])。★安全流程:①查最新已發佈版(含全部檔)②丟棄殘留草稿
     ③newversion off 最新已發佈版 → 新草稿繼承全部檔(不會少檔)。"""
-    import requests
-    p = {'access_token': token}
-    rec = requests.get(f'https://zenodo.org/api/records/{concept}/versions/latest', params=p).json()
+    S = _zsession(token)
+    rec = json.loads(_dl_record_file(f'https://zenodo.org/api/records/{concept}') or b'{}')
     latest_id = rec['id']; real_concept = rec.get('conceptrecid', concept)
     _discard_leftover_drafts(real_concept, token)
-    r = requests.post(f'https://zenodo.org/api/deposit/depositions/{latest_id}/actions/newversion', params=p)
+    r = S.post(f'https://zenodo.org/api/deposit/depositions/{latest_id}/actions/newversion', timeout=180)
     r.raise_for_status()
-    dep = requests.get(r.json()['links']['latest_draft'], params=p).json()
+    dep = S.get(r.json()['links']['latest_draft'], timeout=60).json()
     log(f"  新草稿 {dep['id']}(自最新版 {latest_id} 繼承 {len(dep.get('files', []))} 檔)")
     return dep['id'], dep['links']['bucket'], dep.get('files', [])
 
@@ -276,22 +294,42 @@ def _draft_file_url(dep_files, name):
 
 
 def zenodo_replace(dep_id, bucket, dep_files, name, local_path, token):
-    import requests
-    p = {'access_token': token}
+    u"""在草稿裡換檔(已發佈版不受影響)→ 核對草稿裡的 MD5。失敗就 raise,呼叫端不得發佈。"""
+    S = _zsession(token)
     _, fid = _draft_file_url(dep_files, name)
     if fid:
-        requests.delete(f'https://zenodo.org/api/deposit/depositions/{dep_id}/files/{fid}', params=p)
-    with open(local_path, 'rb') as fp:
-        requests.put(f'{bucket}/{urllib.parse.quote(name)}', data=fp, params=p)
-    log(f"  ✓ 已上傳 {name} ({os.path.getsize(local_path)/1e6:.1f} MB)")
+        S.delete(f'https://zenodo.org/api/deposit/depositions/{dep_id}/files/{fid}', timeout=120)
+    for _i in range(4):
+        try:
+            with open(local_path, 'rb') as fp:
+                r = S.put(f'{bucket}/{urllib.parse.quote(name)}', data=fp, timeout=None)
+            r.raise_for_status()
+            break
+        except Exception as e:
+            if _i == 3:
+                raise RuntimeError(f'上傳 {name} 失敗:{type(e).__name__}')
+            time.sleep(20 * (_i + 1))
+    _md5 = hashlib.md5(open(local_path, 'rb').read()).hexdigest()
+    fl = S.get(f'https://zenodo.org/api/deposit/depositions/{dep_id}/files', timeout=120).json()
+    f = next((x for x in fl if (x.get('filename') or x.get('key')) == name), None)
+    if not f or str(f.get('checksum', '')).split(':')[-1] != _md5:
+        raise RuntimeError(f'草稿裡的 {name} MD5 不符')
+    log(f"  ✓ 已上傳 {name} ({os.path.getsize(local_path)/1e6:.1f} MB,MD5 一致)")
 
 
 def zenodo_publish(dep_id, token):
-    import requests
-    r = requests.post(f'https://zenodo.org/api/deposit/depositions/{dep_id}/actions/publish',
-                      params={'access_token': token})
+    r = _zsession(token).post(f'https://zenodo.org/api/deposit/depositions/{dep_id}/actions/publish', timeout=600)
     r.raise_for_status()
     return r.json().get('doi')
+
+
+def zenodo_discard(dep_id, token):
+    try:
+        S = _zsession(token)
+        S.post(f'https://zenodo.org/api/deposit/depositions/{dep_id}/actions/discard', timeout=60)
+        S.delete(f'https://zenodo.org/api/deposit/depositions/{dep_id}', timeout=60)
+    except Exception:
+        pass
 
 
 # ═══════════════ merge 檔內容 ═══════════════
@@ -303,7 +341,7 @@ def merge_pack(old_bytes, new_lines):
             if not ln or ln.startswith('#'): continue
             try: rec = json.loads(ln)
             except Exception: continue
-            seen[(rec[0], rec[1], rec[2])] = rec
+            seen[(rec[0], rec[1], rec[2])] = rec[:6]   # branch/2 → branch/1(格式統一)
     for rec in new_lines:
         seen[(rec[0], rec[1], rec[2])] = rec
     buf = io.BytesIO()
@@ -362,7 +400,8 @@ def main():
                 #   一晚 cron 觸發 5 次，每次都重抓 2,508 檔 + 重傳一個多餘版本
                 #   （實測單次 54 分鐘 / 2.6 GB）。
                 cur = json.loads(gzip.decompress(_dl_record_file(fu) or b''))
-                if any(k.endswith('|' + d) for k in cur):
+                # ★2026-10-15:原本只要有 1 檔就算「已完成」→ 09-15~18 只有 470~1267 檔的殘缺日永遠不會重抓
+                if sum(1 for k in cur if k.endswith('|' + d)) >= MIN_DAY_STOCKS:
                     log(f"✅ {d} 已在 Zenodo(特徵 json 已含)→ 本次跳過(每日 cron 去重)"); return
         except Exception as e:
             log(f"  (跳過檢查失敗,照常上傳):{e}")
@@ -380,6 +419,7 @@ def main():
     all_feats = {}        # 'sym|date' -> featdict
     san_lup = {}          # date -> {sym: lup}
     san_dispo = {}        # date -> [syms]
+    _bad_days = []        # 殘缺、不發佈的日子(最後以非 0 結束,讓 Actions 變紅燈)
     # 處置快照:TWSE OpenAPI 偶爾回空 body → 重試 3 次;仍失敗就以空清單續跑(處置可日後補,別擋分點主資料)。
     punish_snapshot = []
     for _try in range(3):
@@ -398,42 +438,58 @@ def main():
             lines, feats = branch_pack_and_feats(ftok, syms, ds)
             if not lines:
                 log(f"  {ds}:分點空(非交易日/未公佈)→ skip"); continue
+            _nst = len(set(r[1] for r in lines))
+            if _nst < MIN_DAY_STOCKS:
+                # ★2026-10-15:殘缺日不發佈(原本 09-15~18 只有 470~1267 檔照樣上傳)
+                log(f"  ★{ds}:只有 {_nst} 檔有分點 < {MIN_DAY_STOCKS} → 殘缺,不發佈(多半是配額/方案問題)")
+                _bad_days.append(ds); continue
             ym = ds[:7]; packs_by_month.setdefault(ym, []).extend(lines)
             for sym, fv in feats.items(): all_feats[f'{sym}|{ds}'] = fv
-            san_lup[ds] = lup_map_for_date(ds, is_today)
+            _lm = lup_map_for_date(ds, is_today)
+            if _lm:                      # 空表不寫(原本寫入 {} 會蓋掉別處補好的漲停價)
+                san_lup[ds] = _lm
             san_dispo[ds] = dispo_on_date(punish_snapshot, ds)
-            log(f"  {ds}:分點 {len(lines):,} 列 / {len(feats)} 檔特徵 / 漲停 {len(san_lup[ds])} 檔 / 處置 {len(san_dispo[ds])} 檔")
+            log(f"  {ds}:分點 {len(lines):,} 列 / {len(feats)} 檔特徵 / 漲停 {len(san_lup.get(ds) or {})} 檔 / 處置 {len(san_dispo[ds])} 檔")
         except Exception as e:
             log(f"  ⚠️ {ds} 處理失敗(跳過該日,不影響其他日):{e}")
 
     if not packs_by_month:
-        log('本次無任何資料(全非交易日或未公佈)→ 結束'); return
+        log('本次無任何資料(全非交易日或未公佈)→ 結束')
+        if _bad_days:
+            sys.exit(2)
+        return
     if not args.go:
         log('DRY-RUN 完成(未上傳)。加 --go 才會傳 Zenodo。'); return
 
     # ── 上傳 Z2:分點月包(逐月)+ 特徵 json ──
     dep_id, bucket, dfiles = zenodo_new_draft(Z2_CONCEPT, ztok)
-    for ym, lines in packs_by_month.items():
-        old = published_file_bytes(Z2_CONCEPT, PACK_NAME(ym), ztok)   # 從已發佈版下載(非 draft,免 403)
-        merged, n = merge_pack(old, lines)
-        lp = os.path.join(args.work, PACK_NAME(ym)); open(lp, 'wb').write(merged)
-        log(f"  Z2 月包 {ym}:merge 後 {n:,} 列")
-        zenodo_replace(dep_id, bucket, dfiles, PACK_NAME(ym), lp, ztok)
-    fold = published_file_bytes(Z2_CONCEPT, FEAT_NAME, ztok)
-    fmerged, fn = merge_json_gz(fold, all_feats)
-    flp = os.path.join(args.work, FEAT_NAME); open(flp, 'wb').write(fmerged)
-    log(f"  Z2 特徵:merge 後 {fn:,} 筆(sym|date)")
-    zenodo_replace(dep_id, bucket, dfiles, FEAT_NAME, flp, ztok)
-    doi2 = zenodo_publish(dep_id, ztok)
+    try:
+        for ym, lines in packs_by_month.items():
+            old = published_file_bytes(Z2_CONCEPT, PACK_NAME(ym), ztok)   # 從已發佈版下載(非 draft,免 403)
+            merged, n = merge_pack(old, lines)
+            lp = os.path.join(args.work, PACK_NAME(ym)); open(lp, 'wb').write(merged)
+            log(f"  Z2 月包 {ym}:merge 後 {n:,} 列")
+            zenodo_replace(dep_id, bucket, dfiles, PACK_NAME(ym), lp, ztok)
+        fold = published_file_bytes(Z2_CONCEPT, FEAT_NAME, ztok)
+        fmerged, fn = merge_json_gz(fold, all_feats)
+        flp = os.path.join(args.work, FEAT_NAME); open(flp, 'wb').write(fmerged)
+        log(f"  Z2 特徵:merge 後 {fn:,} 筆(sym|date)")
+        zenodo_replace(dep_id, bucket, dfiles, FEAT_NAME, flp, ztok)
+        doi2 = zenodo_publish(dep_id, ztok)
+    except Exception:
+        zenodo_discard(dep_id, ztok)     # 任何一步失敗 → 丟草稿,絕不發佈殘缺版本
+        raise
     log(f"✅ Z2 發佈 DOI={doi2}")
 
     # ── 上傳 Z1:散資料(漲停 + 處置,以 date 為鍵 merge)──
     dep1, bucket1, dfiles1 = zenodo_new_draft(Z1_CONCEPT, ztok)
-    sold = published_file_bytes(Z1_CONCEPT, SAN_NAME, ztok)   # 從已發佈版下載(非 draft,免 403)
+    try:
+        sold = published_file_bytes(Z1_CONCEPT, SAN_NAME, ztok)   # 從已發佈版下載(非 draft,免 403)
+    except Exception:
+        zenodo_discard(dep1, ztok); raise
     san = {}
     if sold:
-        try: san = json.loads(gzip.decompress(sold).decode('utf-8'))
-        except Exception: san = {}
+        san = json.loads(gzip.decompress(sold).decode('utf-8'))   # 解不開就讓它炸,不可當空的覆蓋
     # 現有 schema:{schema, generated, range, fields:{lup,punish}, lup:{date:{sym:lup}}, punish:{date:[syms]}}
     san.setdefault('schema', 'remora-san-data/1')
     san.setdefault('fields', {'lup': '{date:{sym:漲停價}}', 'punish': '{date:[處置股號]}'})
@@ -448,9 +504,15 @@ def main():
         g.write(json.dumps(san, ensure_ascii=False).encode('utf-8'))
     slp = os.path.join(args.work, SAN_NAME); open(slp, 'wb').write(buf.getvalue())
     log(f"  Z1 散資料:漲停 {len(san['lup'])} 日 / 處置 {len(san['punish'])} 日")
-    zenodo_replace(dep1, bucket1, dfiles1, SAN_NAME, slp, ztok)
-    doi1 = zenodo_publish(dep1, ztok)
+    try:
+        zenodo_replace(dep1, bucket1, dfiles1, SAN_NAME, slp, ztok)
+        doi1 = zenodo_publish(dep1, ztok)
+    except Exception:
+        zenodo_discard(dep1, ztok); raise
     log(f"✅ Z1 發佈 DOI={doi1}")
+    if _bad_days:
+        log(f"★ 有 {len(_bad_days)} 天殘缺未發佈:{_bad_days} → 以非 0 結束")
+        sys.exit(2)
     log('全部完成。')
 
 
