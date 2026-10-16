@@ -14,6 +14,9 @@ on:
       md5:
         description: '月包 MD5(雲端下載後先核對)'
         required: true
+      zname:
+        description: 'Zenodo 上的檔名(GitHub 資產名會吃掉中文,所以另外傳)'
+        required: true
 
 permissions:
   contents: read
@@ -35,8 +38,10 @@ jobs:
       - name: Download pack from release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release download "${{ github.event.inputs.tag }}" -p "${{ github.event.inputs.asset }}" -D packdl
+        run: |
+          gh release download "${{ github.event.inputs.tag }}" -p "${{ github.event.inputs.asset }}" -D packdl
+          mv "packdl/${{ github.event.inputs.asset }}" "packdl/${{ github.event.inputs.zname }}"
       - name: Upload to Zenodo
         env:
           ZENODO_TOKEN: ${{ secrets.ZENODO_TOKEN }}
-        run: python cloud_zenodo_put_pack.py --file "packdl/${{ github.event.inputs.asset }}" --md5 "${{ github.event.inputs.md5 }}"
+        run: python cloud_zenodo_put_pack.py --file "packdl/${{ github.event.inputs.zname }}" --md5 "${{ github.event.inputs.md5 }}"
