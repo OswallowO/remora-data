@@ -302,7 +302,7 @@ def zenodo_replace(dep_id, bucket, dep_files, name, local_path, token):
     for _i in range(4):
         try:
             with open(local_path, 'rb') as fp:
-                r = S.put(f'{bucket}/{urllib.parse.quote(name)}', data=fp, timeout=None)
+                r = S.put(f'{bucket}/{urllib.parse.quote(name)}', data=fp, timeout=(30, 300))   # 原本 None:網路卡住會無限期等
             r.raise_for_status()
             break
         except Exception as e:
