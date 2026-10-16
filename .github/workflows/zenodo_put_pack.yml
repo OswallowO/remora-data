@@ -1,0 +1,42 @@
+# 把本機回補好的月包(先放在 GitHub Release)轉傳到 Zenodo。
+# 本機往 Zenodo 上傳有時只有 20~30 KB/s,GitHub 機房快得多。由本機回補程式自動觸發。
+name: zenodo-put-pack
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag(暫存月包的 release)'
+        required: true
+      asset:
+        description: '月包檔名,例:分點月包_2026-07.jsonl.gz'
+        required: true
+      md5:
+        description: '月包 MD5(雲端下載後先核對)'
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: zenodo-sync          # 與每日同步共用 → 不會同時開 Zenodo 草稿
+  cancel-in-progress: false
+
+jobs:
+  put:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+      - name: Install deps
+        run: pip install requests
+      - name: Download pack from release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release download "${{ github.event.inputs.tag }}" -p "${{ github.event.inputs.asset }}" -D packdl
+      - name: Upload to Zenodo
+        env:
+          ZENODO_TOKEN: ${{ secrets.ZENODO_TOKEN }}
+        run: python cloud_zenodo_put_pack.py --file "packdl/${{ github.event.inputs.asset }}" --md5 "${{ github.event.inputs.md5 }}"
