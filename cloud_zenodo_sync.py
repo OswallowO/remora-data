@@ -48,8 +48,13 @@ _FM_BASE = 'https://api.finmindtrade.com/api/v4/data'
 
 
 def _fetch_branch_paced(token, syms, date_str):
-    """逐檔抓 FinMind 分點(自帶限速)。回 {sym: [raw rows]}。"""
+    """逐檔抓 FinMind 分點(自帶限速)。回 {sym: [raw rows]}。
+    ★2026-10-17:原本抓失敗(例外,含 402 額度滿/斷線)只印一行就跳過、不重試 →
+      10-15 漏 37 檔、10-16 漏 26 檔(都是一段連號 = 那幾分鐘的請求全失敗),
+      而 MIN_DAY_STOCKS=1700 擋不到這種「少幾十檔」的殘缺。
+      改成:失敗的(不是「回 0 筆」的)另外記下來,最多再補 3 輪(等 1/3/5 分鐘),仍失敗就點名。"""
     out = {}
+    failed = []
     for i, sym in enumerate(syms):
         q = urllib.parse.urlencode({'dataset': 'TaiwanStockTradingDailyReport',
                                     'data_id': sym, 'start_date': date_str, 'end_date': date_str, 'token': token})
@@ -58,10 +63,30 @@ def _fetch_branch_paced(token, syms, date_str):
             rows = d.get('data', [])
             if rows: out[sym] = rows
         except Exception as e:
+            failed.append(sym)
             print(f'    [FinMind] {sym} {date_str}: {e}')
         time.sleep(_FM_INTERVAL)
         if i and i % 500 == 0:
             log(f"    …{date_str} 進度 {i}/{len(syms)}")
+    for rnd, wait in enumerate((60, 180, 300), 1):
+        if not failed:
+            break
+        log(f"    {date_str}:{len(failed)} 檔抓取失敗 → 等 {wait} 秒後第 {rnd} 輪補抓")
+        time.sleep(wait)
+        again = []
+        for sym in failed:
+            q = urllib.parse.urlencode({'dataset': 'TaiwanStockTradingDailyReport',
+                                        'data_id': sym, 'start_date': date_str, 'end_date': date_str, 'token': token})
+            try:
+                d = ccp._get_json(f'{_FM_BASE}?{q}', timeout=30)
+                rows = d.get('data', [])
+                if rows: out[sym] = rows
+            except Exception:
+                again.append(sym)
+            time.sleep(max(_FM_INTERVAL, 0.5))
+        failed = again
+    if failed:
+        log(f"    ★{date_str}:補抓 3 輪後仍有 {len(failed)} 檔失敗:{failed[:30]}")
     return out
 
 
