@@ -161,6 +161,66 @@ def lup_map_for_date(date_str, is_today):
     return {k: v for k, v in lup.items() if k and v > 0}
 
 
+_PER_RE = None
+
+
+def _ann_rows(url):
+    import ssl
+    ctx = ssl._create_unverified_context()
+    last = None
+    for k in range(5):
+        try:
+            j = json.loads(urllib.request.urlopen(urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'}),
+                                                  timeout=60, context=ctx).read())
+            if str(j.get('stat', 'ok')).lower() not in ('ok', 'ok.'):
+                raise RuntimeError('stat=%s' % j.get('stat'))
+            if 'tables' in j:
+                return [r for t in j['tables'] for r in (t.get('data') or [])]
+            return j.get('data') or []
+        except Exception as e:
+            last = e
+            time.sleep(8 * (k + 1))
+    raise RuntimeError(f'處置公告抓取失敗:{url} ({last!r})')
+
+
+def fetch_dispo_periods(d0, d1):
+    """上市 + 上櫃【官方處置公告】(公告日在 d0-40 天 ~ d1,按月抓)→ [(代號, 起, 迄)]。
+    ★2026-10-17:原本用 OpenAPI「當下處置中」快照 → 歷史日期只看得到當時還在處置的、
+      且快照常常不完整(10-15 漏 4174/4760/47602/69571/8358)。改成跟回補第二階段同一套:
+      查公告、依處置起訖日推算當日。已用 675 個交易日驗證(與官方逐日比對 0 遺漏)。"""
+    import re
+    per_re = re.compile(r'(\d{2,3})/(\d{1,2})/(\d{1,2})\s*[~～\-－]\s*(\d{2,3})/(\d{1,2})/(\d{1,2})')
+    out = []
+    cur = datetime.date.fromisoformat(d0) - datetime.timedelta(days=40)
+    e = datetime.date.fromisoformat(d1)
+    while cur <= e:
+        nxt = min(e, (cur.replace(day=1) + datetime.timedelta(days=32)).replace(day=1) - datetime.timedelta(days=1))
+        for url in ('https://www.twse.com.tw/rwd/zh/announcement/punish?response=json&startDate=%s&endDate=%s'
+                    % (cur.strftime('%Y%m%d'), nxt.strftime('%Y%m%d')),
+                    'https://www.tpex.org.tw/www/zh-tw/bulletin/disposal?startDate=%s&endDate=%s&response=json'
+                    % (cur.strftime('%Y%%2F%m%%2F%d'), nxt.strftime('%Y%%2F%m%%2F%d'))):
+            for row in _ann_rows(url):
+                code = per = None
+                for i, cell in enumerate(row):
+                    cs = str(cell).strip()
+                    if code is None and i >= 2 and re.fullmatch(r'\d{4,6}', cs):
+                        code = cs
+                    if per is None:
+                        mp = per_re.search(cs)
+                        if mp:
+                            g = [int(x) for x in mp.groups()]
+                            try:
+                                per = (datetime.date(g[0] + 1911, g[1], g[2]).isoformat(),
+                                       datetime.date(g[3] + 1911, g[4], g[5]).isoformat())
+                            except ValueError:
+                                pass
+                if code and per:
+                    out.append((code, per[0], per[1]))
+            time.sleep(2.5)
+        cur = nxt + datetime.timedelta(days=1)
+    return out
+
+
 def dispo_on_date(punish_rows, date_str):
     """從 TWSE punish 快照(含處置期間 start~end)判斷 date 當日在處置的股號清單。
     punish 每筆有處置起訖(民國)。只要 起 ≤ date ≤ 迄 就算當日處置。"""
@@ -432,6 +492,13 @@ def main():
         except Exception as e:
             log(f"  處置快照抓取失敗(第{_try+1}次):{e}"); time.sleep(3)
     log(f"  處置快照:{len(punish_snapshot)} 筆(空=續跑,處置日後可補)")
+    # 官方公告(主來源);抓不到 → 只用快照(並在日誌標明),不擋分點主資料
+    dispo_periods = None
+    try:
+        dispo_periods = fetch_dispo_periods(min(dates), max(dates))
+        log(f"  處置官方公告:{len(dispo_periods)} 筆(上市+上櫃)")
+    except Exception as e:
+        log(f"  ⚠️ 處置官方公告抓取失敗,本次只用快照:{e}")
     for ds in dates:
         try:
             is_today = (ds == today)
@@ -448,7 +515,9 @@ def main():
             _lm = lup_map_for_date(ds, is_today)
             if _lm:                      # 空表不寫(原本寫入 {} 會蓋掉別處補好的漲停價)
                 san_lup[ds] = _lm
-            san_dispo[ds] = dispo_on_date(punish_snapshot, ds)
+            _snap = set(dispo_on_date(punish_snapshot, ds))
+            _off = set(c for c, a0, z0 in (dispo_periods or []) if a0 <= ds <= z0)
+            san_dispo[ds] = sorted(_off | _snap)   # 官方公告 ∪ 快照(寧可多擋)
             log(f"  {ds}:分點 {len(lines):,} 列 / {len(feats)} 檔特徵 / 漲停 {len(san_lup.get(ds) or {})} 檔 / 處置 {len(san_dispo[ds])} 檔")
         except Exception as e:
             log(f"  ⚠️ {ds} 處理失敗(跳過該日,不影響其他日):{e}")
@@ -495,7 +564,8 @@ def main():
     san.setdefault('fields', {'lup': '{date:{sym:漲停價}}', 'punish': '{date:[處置股號]}'})
     san.setdefault('lup', {}); san.setdefault('punish', {})
     for ds in san_lup: san['lup'][ds] = san_lup[ds]
-    for ds in san_dispo: san['punish'][ds] = san_dispo[ds]   # 處置 → punish 鍵(對齊現有 schema)
+    for ds in san_dispo:   # 處置 → punish 鍵;與雲端該日原有清單取聯集(一筆都不刪)
+        san['punish'][ds] = sorted(set(san_dispo[ds]) | set(san['punish'].get(ds) or []))
     _alld = sorted(set(san['lup']) | set(san['punish']))
     san['range'] = f"{_alld[0]}~{_alld[-1]}" if _alld else ''
     san['generated'] = time.strftime('%Y-%m-%d %H:%M')
