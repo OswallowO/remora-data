@@ -33,7 +33,12 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--file', required=True)
     ap.add_argument('--md5', required=True)
+    ap.add_argument('--concept', default='20800284', help='20800284=分點(Z2) / 20800838=散資料(Z1)')
     a = ap.parse_args()
+    global CONCEPT
+    CONCEPT = a.concept
+    if CONCEPT not in ('20800284', '20800838'):
+        log('★ 未知的 concept %s → 中止' % CONCEPT); return 5
     name = os.path.basename(a.file)
     md5 = hashlib.md5(open(a.file, 'rb').read()).hexdigest()
     if md5 != a.md5:

@@ -17,6 +17,10 @@ on:
       zname:
         description: 'Zenodo 上的檔名(GitHub 資產名會吃掉中文,所以另外傳)'
         required: true
+      concept:
+        description: 'Zenodo concept:20800284=分點(Z2,預設) / 20800838=散資料(Z1)'
+        required: false
+        default: '20800284'
 
 permissions:
   contents: read
@@ -44,4 +48,4 @@ jobs:
       - name: Upload to Zenodo
         env:
           ZENODO_TOKEN: ${{ secrets.ZENODO_TOKEN }}
-        run: python cloud_zenodo_put_pack.py --file "packdl/${{ github.event.inputs.zname }}" --md5 "${{ github.event.inputs.md5 }}"
+        run: python cloud_zenodo_put_pack.py --file "packdl/${{ github.event.inputs.zname }}" --md5 "${{ github.event.inputs.md5 }}" --concept "${{ github.event.inputs.concept || '20800284' }}"
