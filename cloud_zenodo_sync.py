@@ -118,6 +118,171 @@ def branch_pack_and_feats(token, syms, date_str):
     return lines, feats
 
 
+# ═══════════════ 漲停:全市場(上市+上櫃)歷史日報 ═══════════════
+FULL_LUP_NAME = '散資料_全市場漲停價.json.gz'   # Z1 第二個檔:客戶端選股的漲停價權威檔 {date:{sym:漲停價}}
+
+
+def _tick_c(c):
+    """整數分價位 → 檔位(分)。與客戶端 _tick_c 相同。"""
+    if c < 1000: return 1
+    if c < 5000: return 5
+    if c < 10000: return 10
+    if c < 50000: return 50
+    if c < 100000: return 100
+    return 500
+
+
+def lup_int(prev):
+    u"""漲停價 = 前收 x 1.1 無條件捨去到合法檔位 —— 全程整數分運算(與客戶端 calculate_limit_up_price 相同)。
+    不用 ccp._floor_tick:浮點的 71.1 會變 71.0999… 被砍成 71.0(少一檔,已知 bug)。"""
+    yc = int(round(float(prev) * 100.0))
+    if yc <= 0:
+        return 0.0
+    lu = yc * 11
+    t = _tick_c(lu // 10)
+    return ((lu // (t * 10)) * t) / 100.0
+
+
+def lup_map_full(date_str, tries=3):
+    u"""★2026-10-20:全市場(上市 MI_INDEX + 上櫃 otc)某日漲停價 {sym: 漲停價}。
+    前收 = 該日 收盤 − 漲跌(含除權息調整,= 交易所當日參考價);只收 4 碼普通股。
+    上市、上櫃【各自】要 >= 500 檔才回傳,否則回 {}(不寫半套資料)。
+    與客戶端 _fill_fullmarket_lup_from_exchange、權威檔原本的產生方式相同。"""
+    ymd = date_str.replace('-', '')
+    out = {}
+    tw = None
+    for _i in range(tries):   # 證交所 13:30~14:00 尖峰會暫停「全部資料」查詢
+        try:
+            tw = json.load(urllib.request.urlopen(urllib.request.Request(
+                'https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX?date=%s&type=ALL&response=json' % ymd,
+                headers=UA), timeout=30))
+            if tw.get('tables'):
+                break
+        except Exception as e:
+            log(f"  ⚠️ 上市日報 {date_str} 第 {_i + 1} 次失敗:{e}")
+        time.sleep(20)
+    n_tw = 0
+    for t in ((tw or {}).get('tables') or []):
+        f = [str(x) for x in (t.get('fields') or [])]
+        if '證券代號' not in f or '收盤價' not in f:
+            continue
+        ic, icl = f.index('證券代號'), f.index('收盤價')
+        isg = f.index('漲跌(+/-)') if '漲跌(+/-)' in f else None
+        idf = f.index('漲跌價差') if '漲跌價差' in f else None
+        if idf is None:
+            continue
+        for r in (t.get('data') or []):
+            code = str(r[ic]).strip()
+            if not (len(code) == 4 and code.isdigit()):
+                continue
+            c = _num(r[icl]); ch = _num(r[idf])
+            if not c or c <= 0:
+                continue
+            if isg is not None and '-' in str(r[isg]):
+                ch = -abs(ch)
+            v = lup_int(round(c - ch, 2))
+            if v > 0:
+                out[code] = v; n_tw += 1
+    if n_tw < 500:
+        log(f"  ⚠️ {date_str} 上市日報只有 {n_tw} 檔 → 不產出")
+        return {}
+    try:
+        tp = json.load(urllib.request.urlopen(urllib.request.Request(
+            'https://www.tpex.org.tw/www/zh-tw/afterTrading/otc?date=%s&type=EW&response=json'
+            % date_str.replace('-', '%2F'), headers=UA), timeout=30))
+    except Exception as e:
+        log(f"  ⚠️ 上櫃日報 {date_str} 失敗:{e} → 不產出")
+        return {}
+    n_tp = 0
+    for t in (tp.get('tables') or []):
+        f = [str(x).strip() for x in (t.get('fields') or [])]
+        if '代號' not in f:
+            continue
+        ic = f.index('代號')
+        icl = next((i for i, x in enumerate(f) if x.startswith('收盤')), None)
+        idf = next((i for i, x in enumerate(f) if x.startswith('漲跌') and '停' not in x), None)
+        if icl is None or idf is None:
+            continue
+        for r in (t.get('data') or []):
+            code = str(r[ic]).strip()
+            if not (len(code) == 4 and code.isdigit()):
+                continue
+            raw_ch = str(r[idf]).strip()
+            c = _num(r[icl])
+            try:
+                ch = float(raw_ch.replace(',', ''))
+            except Exception:
+                continue          # '除息'、'---' 等非數字 → 跳過(不猜)
+            if not c or c <= 0:
+                continue
+            v = lup_int(round(c - ch, 2))
+            if v > 0:
+                out[code] = v; n_tp += 1
+    if n_tp < 500:
+        log(f"  ⚠️ {date_str} 上櫃日報只有 {n_tp} 檔 → 不產出")
+        return {}
+    return out
+
+
+def repair_lup(ztok, work, go=True, lookback_days=60, min_count=1000):
+    u"""★2026-10-20:把 Z1 兩份漲停價(散資料 lup 欄 + 全市場漲停價檔)最近 lookback 天裡【缺的或不足的交易日】補齊。
+
+    為什麼需要:每日模式處理「當天」時,即時端點晚上仍停在前一天 → 依設計不產出、留給「之後的歷史路徑」;
+    但每日模式只處理最新一天、且已上傳就跳過 → 那條路永遠不會發生。實測 Z1 lup 自 09-11 起全空,
+    全市場漲停價檔則從來沒有被管線更新過(停在一次性回補的 10-16)→ 客戶端 10-20 選股涵蓋率 10.5%。
+    交易日 = 散資料 punish 有鍵的日子(管線每個處理過的交易日都會寫)。已存在且足量的日子一筆都不改。"""
+    sold = published_file_bytes(Z1_CONCEPT, SAN_NAME, ztok)
+    san = json.loads(gzip.decompress(sold).decode('utf-8')) if sold else {}
+    fold = published_file_bytes(Z1_CONCEPT, FULL_LUP_NAME, ztok)
+    full = json.loads(gzip.decompress(fold).decode('utf-8')) if fold else {}
+    san.setdefault('lup', {}); san.setdefault('punish', {})
+    today = datetime.date.today()
+    lo = (today - datetime.timedelta(days=lookback_days)).isoformat()
+    days = sorted(d for d in set(san['punish']) | set(full) if lo <= d <= today.isoformat())
+    need = [d for d in days if len(full.get(d) or {}) < min_count or len(san['lup'].get(d) or {}) < min_count]
+    log(f"  漲停價修補:最近 {lookback_days} 天 {len(days)} 個交易日,缺/不足 {len(need)} 天 {need[:12]}"
+        f"{'…' if len(need) > 12 else ''}")
+    fixed = []
+    for d in need:
+        m = lup_map_full(d)
+        if len(m) < min_count:
+            continue
+        if len(full.get(d) or {}) < min_count:
+            full[d] = {**m, **{k: v for k, v in (full.get(d) or {}).items() if v}}   # 既有值優先
+        if len(san['lup'].get(d) or {}) < min_count:
+            san['lup'][d] = {**m, **{k: v for k, v in (san['lup'].get(d) or {}).items() if v}}
+        fixed.append(d)
+        log(f"    {d}:補入 {len(m)} 檔")
+        time.sleep(3)   # 對交易所客氣一點
+    if not fixed:
+        log('  漲停價修補:沒有需要補的日子')
+        return 0
+    if not go:
+        log(f'  漲停價修補(DRY-RUN):會補 {len(fixed)} 天,不上傳')
+        return len(fixed)
+
+    def _gz(obj, name):
+        b = io.BytesIO()
+        with gzip.GzipFile(fileobj=b, mode='wb', compresslevel=6) as g:
+            g.write(json.dumps(obj, ensure_ascii=False).encode('utf-8'))
+        pth = os.path.join(work, name); open(pth, 'wb').write(b.getvalue())
+        return pth
+    _alld = sorted(set(san['lup']) | set(san['punish']))
+    san['range'] = f"{_alld[0]}~{_alld[-1]}" if _alld else ''
+    san['generated'] = time.strftime('%Y-%m-%d %H:%M')
+    p_san, p_full = _gz(san, SAN_NAME), _gz(full, FULL_LUP_NAME)
+    dep, bucket, dfiles = zenodo_new_draft(Z1_CONCEPT, ztok)
+    try:
+        zenodo_replace(dep, bucket, dfiles, SAN_NAME, p_san, ztok)
+        zenodo_replace(dep, bucket, dfiles, FULL_LUP_NAME, p_full, ztok)
+        doi = zenodo_publish(dep, ztok)
+    except Exception:
+        zenodo_discard(dep, ztok)
+        raise
+    log(f"✅ Z1 漲停價修補發佈 {len(fixed)} 天 DOI={doi}")
+    return len(fixed)
+
+
 # ═══════════════ 漲停:當日(live)或歷史(MI_INDEX)═══════════════
 def _num(x):
     try: return float(str(x).replace(',', '').replace('+', '').replace('%', ''))
@@ -487,7 +652,11 @@ def main():
                 cur = json.loads(gzip.decompress(_dl_record_file(fu) or b''))
                 # ★2026-10-15:原本只要有 1 檔就算「已完成」→ 09-15~18 只有 470~1267 檔的殘缺日永遠不會重抓
                 if sum(1 for k in cur if k.endswith('|' + d)) >= MIN_DAY_STOCKS:
-                    log(f"✅ {d} 已在 Zenodo(特徵 json 已含)→ 本次跳過(每日 cron 去重)"); return
+                    log(f"✅ {d} 已在 Zenodo(特徵 json 已含)→ 本次跳過分點(每日 cron 去重)")
+                    # 分點已完成也要補漲停價(漲停價要等交易所日報,可能比分點晚到)
+                    try: repair_lup(ztok, args.work, go=args.go)
+                    except Exception as _e_rl: log(f"  ⚠️ 漲停價修補失敗(下次再試):{_e_rl}")
+                    return
         except Exception as e:
             log(f"  (跳過檢查失敗,照常上傳):{e}")
         dates = [d]
@@ -537,7 +706,7 @@ def main():
                 _bad_days.append(ds); continue
             ym = ds[:7]; packs_by_month.setdefault(ym, []).extend(lines)
             for sym, fv in feats.items(): all_feats[f'{sym}|{ds}'] = fv
-            _lm = lup_map_for_date(ds, is_today)
+            _lm = lup_map_full(ds) or lup_map_for_date(ds, is_today)   # ★全市場日報優先(含上櫃、整數算法)
             if _lm:                      # 空表不寫(原本寫入 {} 會蓋掉別處補好的漲停價)
                 san_lup[ds] = _lm
             _snap = set(dispo_on_date(punish_snapshot, ds))
@@ -605,6 +774,8 @@ def main():
     except Exception:
         zenodo_discard(dep1, ztok); raise
     log(f"✅ Z1 發佈 DOI={doi1}")
+    try: repair_lup(ztok, args.work, go=args.go)   # ★最近 60 天缺的漲停價一併補齊(含全市場漲停價檔)
+    except Exception as _e_rl: log(f"  ⚠️ 漲停價修補失敗(下次再試):{_e_rl}")
     if _bad_days:
         log(f"★ 有 {len(_bad_days)} 天殘缺未發佈:{_bad_days} → 以非 0 結束")
         sys.exit(2)
