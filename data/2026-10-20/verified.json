@@ -1,0 +1,10 @@
+{
+ "date": "2026-10-20",
+ "quote_date": "2026-10-19",
+ "source": "endpoint Date field(直接判定,非推論)",
+ "twse_date": "2026-10-19",
+ "tpex_date": "2026-10-20",
+ "lup_source": "finmind(TaiwanStockPrice close-spread)",
+ "lup_n": 227,
+ "checked_at": "2026-10-20T18:36:22"
+}
