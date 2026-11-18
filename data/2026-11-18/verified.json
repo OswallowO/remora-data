@@ -1,0 +1,10 @@
+{
+ "date": "2026-11-18",
+ "quote_date": "2026-11-18",
+ "source": "endpoint Date field(直接判定,非推論)",
+ "twse_date": "2026-11-18",
+ "tpex_date": "2026-11-18",
+ "lup_source": "twse/tpex",
+ "lup_n": 2368,
+ "checked_at": "2026-11-18T22:11:49"
+}
