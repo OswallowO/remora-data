@@ -649,3 +649,4 @@
 {"utc": "2026-11-25 08:59:16", "taipei": "2026-11-25 16:59:16", "finmind_latest": "2026-11-25", "target": "2026-11-25", "status": "produced"}
 {"utc": "2026-11-25 09:19:20", "taipei": "2026-11-25 17:19:20", "finmind_latest": "2026-11-25", "target": "2026-11-25", "status": "skip-already-ready"}
 {"utc": "2026-11-25 23:11:13", "taipei": "2026-11-26 07:11:13", "finmind_latest": "2026-11-25", "target": "2026-11-25", "status": "skip-already-ready"}
+{"utc": "2026-11-25 23:30:51", "taipei": "2026-11-26 07:30:51", "finmind_latest": "2026-11-25", "target": "2026-11-25", "status": "skip-already-ready"}
